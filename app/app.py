@@ -41,6 +41,8 @@ from app.config import DATABASE_URL, REDIS_URL, REFRESH_TOKEN_EXPIRE_DAYS
 from app.consumers import fanout_consumer, realtime_consumer
 from app.event_bus import bus
 from app.ws_manager import manager, system
+from app.consumers import fanout_consumer, realtime_consumer
+
 
 # Lifespan
 
@@ -304,6 +306,8 @@ async def create_post(
 # Timeline (public — users can share timeline links)
 
 
+# Timeline
+
 @app.get("/timeline/{user_id}")
 async def get_timeline(user_id: str, limit: int = 50, offset: int = 0):
     """
@@ -320,6 +324,14 @@ async def get_timeline(user_id: str, limit: int = 50, offset: int = 0):
 
 # WebSockets
 
+    The Redis step is O(log n + limit). The Postgres step is one indexed scan.
+    Total cost is effectively constant regardless of timeline length.
+    """
+    post_ids = await cache.get_timeline_ids(user_id, limit=limit, offset=offset)
+    return await db.get_posts_by_ids(post_ids)
+
+
+# WebSockets
 
 @app.websocket("/ws/events")
 async def system_events_ws(ws: WebSocket):
@@ -330,7 +342,6 @@ async def system_events_ws(ws: WebSocket):
             await ws.receive_text()
     except WebSocketDisconnect:
         system.disconnect(ws)
-
 
 @app.websocket("/ws/{user_id}")
 async def user_ws(
