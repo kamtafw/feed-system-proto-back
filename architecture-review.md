@@ -1,5 +1,7 @@
 # Milestone 1 — Authentication
 ### FanoutFeed · `milestone-1-auth`
+# Milestone 1 — Authentication
+### FanoutFeed · `milestone-1-auth`
 
 ---
 
@@ -25,9 +27,36 @@ caller was actually Alice. This made every user-specific feature impossible to b
 correctly: rate limiting, moderation, bookmarks, notifications, and DMs all require
 a verified identity. There was also no concept of a session, so there was no way to
 log someone out or revoke access.
+Replace the `?author_id=` query parameter pattern with verified JWT-based identity.
+Every user action — posting, following, connecting via WebSocket — is now tied to a
+real authenticated account that cannot be forged by another client.
 
 ---
 
+## Previous architecture and its limitation
+
+At the end of Milestone 0.5, the system had persistent storage (PostgreSQL + Redis)
+and a working event-driven fanout pipeline, but no identity layer:
+
+```
+POST /posts?author_id=alice
+```
+
+Any client could set `author_id` to any value. There was no way to know if the
+caller was actually Alice. This made every user-specific feature impossible to build
+correctly: rate limiting, moderation, bookmarks, notifications, and DMs all require
+a verified identity. There was also no concept of a session, so there was no way to
+log someone out or revoke access.
+
+---
+
+## Why this milestone comes before more features
+
+Auth cannot be retrofitted. Every route that currently accepts `?author_id=` as a
+parameter would need to be rewritten. Every consumer that trusts the event payload's
+`author_id` would need to be re-evaluated. Every test would break. The longer auth
+is deferred, the more expensive it becomes. Adding it now — before rate limiting,
+DMs, notifications, or any other user-specific feature — is the correct sequencing.
 ## Why this milestone comes before more features
 
 Auth cannot be retrofitted. Every route that currently accepts `?author_id=` as a
