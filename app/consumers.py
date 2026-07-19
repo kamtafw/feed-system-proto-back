@@ -17,6 +17,8 @@ from app.ws_manager import manager, system
 
 
 async def fanout_consumer(payload: dict) -> None:
+    # raise Exception("deliberate failure — testing XAUTOCLAIM")  # ← TEMP
+
     post_id     = payload["post_id"]
     author_id   = payload["author_id"]
     author_name = payload["author_name"]
