@@ -33,7 +33,7 @@ async def init_cache(url: str) -> None:
 
 async def close_cache() -> None:
     if _client:
-        await _client.aclose()
+        await _client.close()
 
 
 # Timeline operations
