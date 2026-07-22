@@ -1,20 +1,21 @@
 """
-app.py — FastAPI application, now with authentication.
+app.py — FastAPI application.
 
-What changed from the pre-auth version:
-    - lifespan seeds default passwords for the four seed users
-    - POST /auth/register, POST /auth/login, POST /auth/refresh, POST /auth/logout
-    - POST /posts           — requires Bearer token; author_id comes from token
-    - POST /me/follow/:id   — requires Bearer token (replaces /users/:id/follow/:id)
-    - DELETE /me/follow/:id — requires Bearer token
-    - GET /me/following     — requires Bearer token
-    - WS /ws/feed?token=    — requires access token as query param
-    - WS /ws/events         — still public (debug panel)
+Milestone 3 change: manager.init(REDIS_URL) and manager.close() added to
+the lifespan. ConnectionManager now needs Redis to set up the Pub/Sub
+listener before any WebSocket connection arrive.
 
-Public routes (no auth needed):
-    - GET /users
-    - GET /users/:id/following
-    - GET /timeline/:id
+Initialisation order matters:
+    1. db       —   PostgreSQL pool (consumers depend on it)
+    2. cache    —   Redis timeline ops (consumers depend on it)
+    3. bus      —   Redis Streams event bus
+    4. manager  —   Redis Pub/Sub WebSocket router (must be ready before
+                    the first WebSocket connection, which could arrive the
+                    moment uvicorn starts accepting requests)
+    5. listener —   starts consuming from Redis Streams
+
+Teardown is the reverse: cancel listener first so no new events are
+processed while the connections below it are closing.
 """
 
 import asyncio
@@ -44,41 +45,42 @@ from app.ws_manager import manager, system
 
 # Lifespan
 
-_SEED_PASSWORD = "password123"  # default password for the four seed users
+_SEED_PASSWORD = "password123"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # initialise in dependency order: storage first, bus last
+    # Storage
     await db.init_db(DATABASE_URL)
     await cache.init_cache(REDIS_URL)
-    await bus.init(REDIS_URL)
 
-    # register consumers (fanout must be first — runs before realtime)
+    # Event bus (Redis Streams)
+    await bus.init(REDIS_URL)
     bus.subscribe("PostCreated", fanout_consumer)
     bus.subscribe("PostCreated", realtime_consumer)
 
-    # give seed users a known password so I can log in immediately
-    # set_password_hash only updates rows where password_hash IS NULL —
-    # existing passwords are never overwritten
+    # WebSocket router (Redis Pub/Sub) — Milestone 3
+    await manager.init(REDIS_URL)
+
+    # Seed default passwords for seed users (idempotent)
     hashed = hash_password(_SEED_PASSWORD)
     for uid in ("alice", "bob", "carol", "dave"):
         await db.set_password_hash(uid, hashed)
 
-    # start the Redis subscription loop as a background task
-    # without this task, published events have no listener
+    # Start event stream listener
     listener = asyncio.create_task(bus.listen())
     print(f"✅  All systems ready  (seed password: {_SEED_PASSWORD!r})")
 
     yield  # ← server runs here
 
-    # graceful shutdown
+    # Teardown (reverse order)
     listener.cancel()
     try:
         await listener
     except asyncio.CancelledError:
         pass
 
+    await manager.close()  # stop Pub/Sub listener, disconnect Redis
     await bus.close()
     await cache.close_cache()
     await db.close_db()
@@ -270,10 +272,8 @@ async def create_post(
     created_at = time.time()
     content = body.content.strip()
 
-    # 1. persist post to PostgreSQL
     await db.create_post(post_id, author_id, user["name"], content, created_at)
 
-    # 2. broadcast to debug panel
     await system.broadcast(
         {
             "event": "POST_CREATED",
@@ -284,9 +284,6 @@ async def create_post(
         }
     )
 
-    # 3. publish event — consumers run asynchronously in the listen() task
-    #    created_at is included so fanout_consumer can use it as the sorted
-    #    set score without an extra DB round-trip.
     await bus.publish(
         "PostCreated",
         {
@@ -297,11 +294,10 @@ async def create_post(
         },
     )
 
-    # returns immediately — fanout and realtime happen in the background
     return {"post_id": post_id}
 
 
-# Timeline (public — users can share timeline links)
+# Timeline
 
 
 @app.get("/timeline/{user_id}")
@@ -319,11 +315,12 @@ async def get_timeline(user_id: str, limit: int = 50, offset: int = 0):
 
 
 # WebSockets
+# Note: /ws/events must be defined BEFORE /ws/feed to avoid route shadowing.
 
 
 @app.websocket("/ws/events")
 async def system_events_ws(ws: WebSocket):
-    """Public — debug event stream panel."""
+    """Public debug event stream. Per-worker — shows events from this process."""
     await system.connect(ws)
     try:
         while True:
@@ -332,8 +329,8 @@ async def system_events_ws(ws: WebSocket):
         system.disconnect(ws)
 
 
-@app.websocket("/ws/{user_id}")
-async def user_ws(
+@app.websocket("/ws/feed")
+async def feed_ws(
     ws: WebSocket,
     current_user: dict = Depends(get_ws_user),  # token from ?token= query param
 ):
@@ -341,10 +338,13 @@ async def user_ws(
     Authenticated personal feed channel.
     Connect: ws://localhost:8000/ws/feed?token=<access_token>
     Receives: { type: "NEW_POST", post_id, author_id, author_name }
+
+    On connect: this worker subscribes to ws:notify:{user_id} on Redis.
+    On disconnect: this worker unsubscribes.
+    Notifications arrive via Redis Pub/Sub from any worker.
     """
     user_id = current_user["sub"]
     await manager.connect(user_id, ws)
-
     try:
         while True:
             await ws.receive_text()
