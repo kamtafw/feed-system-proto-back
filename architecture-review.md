@@ -1,453 +1,217 @@
-# Milestone 2 — Event Bus Durability
+# Milestone 3 — WebSocket Cross-Worker Routing
 
-## FanoutFeed · `milestone-2-redis-streams`
+## FanoutFeed · `milestone-3-ws-routing`
 
 ---
 
 ## Goal
 
-Replace the Redis Pub/Sub event bus with Redis Streams, giving the `PostCreated`
-pipeline at-least-once delivery guarantees. A message published to the event bus
-must survive the consumer going offline and be delivered when it comes back.
+Make real-time `NEW_POST` notifications reach a user regardless of which
+uvicorn worker holds their WebSocket connection, so the HTTP layer can run
+more than one worker process.
 
 ---
 
 ## Previous architecture and its limitation
 
-At the end of Milestone 1, the event bus used Redis Pub/Sub:
+`ConnectionManager` held a plain Python dict mapping `user_id → WebSocket`.
+`realtime_consumer` called `manager.send()`, which looked up the socket in
+that dict and called `ws.send_json()` directly.
 
 ```
-bus.publish("PostCreated", payload)
-    │
-    └─► redis.publish("PostCreated", json)
-                │
-                ▼
-         listen() task
-         (SUBSCRIBE loop)
-              │
-         ┌────┴─────┐
-         ▼          ▼
-   fanout_consumer  realtime_consumer
+realtime_consumer
+│
+└─► manager.send(user_id, data)
+│
+└─► self._connections[user_id].send_json(data)
 ```
 
-Pub/Sub is a live broadcast. `PUBLISH` sends the message to whoever is currently
-subscribed. If the `listen()` background task was not running at the moment
-`PUBLISH` fired — server restart, `uvicorn --reload` hot reload, unhandled
-exception in the asyncio task — the message was gone. The post existed in
-PostgreSQL, but fanout never ran. No follower received the post.
+This only works if the consumer and the target's WebSocket live in the
+same process. With a single worker this was invisible — everything is in
+one process by definition. The moment a second worker is introduced,
+whichever worker's event-loop happened to consume the `PostCreated`
+message from the Streams consumer group is not necessarily the worker
+holding the follower's socket. That follower's local dict has no entry,
+`manager.send()` silently no-ops, and the notification is lost.
 
-At the prototype stage this was acceptable: users would see the post on next
-refresh, the failure was rare, and there were no real users to notice. With
-authenticated users on the system, this is a silent correctness bug. It becomes
-a reliability problem before adding the separate worker process in Milestone 4,
-where the HTTP server and the consumer run in different processes with an
-intentional startup gap between them.
+This was the structural blocker to horizontal scaling of the HTTP layer —
+running 2+ workers behind a reverse proxy for more request-handling
+capacity was not possible without this fix.
 
 ---
 
-## Why Redis Streams
+## Why Redis Pub/Sub for routing
 
-Redis Streams is an append-only log — a data structure that Redis was explicitly
-designed for event sourcing at this scale.
+The same pattern already exists between `bus.publish()` and worker
+processes for `PostCreated` — Redis as the shared intermediary that every
+process can reach. Pub/Sub (not Streams) is the right primitive here
+specifically *because* durability is not required: a missed notification
+just means the user sees the post on their next reconnect or refresh,
+same as any offline user under Fanout-on-Write. There's no need to retry
+or persist a "user wasn't listening" event.
 
 ```
-XADD        → append a message to the log (replaces PUBLISH)
-XREADGROUP  → deliver messages to a named consumer group (replaces SUBSCRIBE)
-XACK        → confirm a message was fully processed (no equivalent in Pub/Sub)
-XAUTOCLAIM  → reclaim and retry unACKed messages after a timeout
+realtime_consumer (on any worker)
+│
+└─► redis.publish("ws:notify:alice", json)
+│
+Worker A subscribes to "ws:notify:alice"
+(because alice is connected to Worker A)
+│
+Finds alice in its local connection dict
+Sends NEW_POST over her WebSocket
 ```
 
-The key difference: the message is not removed from the stream until the consumer
-explicitly ACKs it. If the consumer crashes between receiving and processing, the
-message stays in the **pending list** — a per-group record of delivered-but-not-ACKed
-messages. On restart, `XAUTOCLAIM` finds these messages and re-delivers them.
-
-Think of Pub/Sub as a live radio broadcast — tune in or miss it. Streams is a
-podcast — you can listen when you're ready, and if you pause mid-episode, you
-resume from exactly where you left off.
-
----
-
-## Delivery guarantee
-
-**At-least-once.** A message is retried until it is successfully ACKed. Consumers
-must tolerate duplicate delivery.
-
-`fanout_consumer` is safe to retry because its writes use Redis `ZADD`. Writing
-a post ID that already exists in a user's sorted set is a no-op — no duplicate
-timeline entries, no side effects.
-
-`realtime_consumer` sends WebSocket messages on retry, which a client might
-receive twice. At this scale, an occasional duplicate "you have a new post"
-notification is acceptable.
-
-**Exactly-once** would require distributed transactions across Redis and PostgreSQL.
-That is out of scope for this architecture.
+Think of it as a hotel intercom: each floor (worker) manages its own
+rooms (connections), but every floor shares the same switchboard (Redis)
+to route a call to the right room regardless of which floor placed it.
 
 ---
 
 ## Design decisions
 
-### Sequential handler execution is preserved
+### Per-user channels, not a single broadcast channel
 
-In Milestone 1, `fanout_consumer` and `realtime_consumer` ran sequentially within
-the `listen()` loop — fanout first, realtime second — guaranteeing that the
-timeline was written before the WebSocket push fired. This contract is preserved
-in `_process()`:
+Publishing to `ws:notify:{user_id}` rather than one shared channel means
+each worker only subscribes to channels for users it actually holds —
+Worker A doesn't receive (and discard) every notification in the system,
+only the ones addressed to its own connected users. This keeps the
+Pub/Sub traffic proportional to local connection count, not global post
+volume.
 
-```python
-for handler in self._handlers.get(event_type, []):
-    await handler(payload)  # fanout runs, then realtime, in order
+### The `ws:_keepalive` channel
 
-await self._client.xack(...)  # only after both succeed
-```
+`redis-py`'s `pubsub.listen()` is a generator that must have at least one
+active subscription to avoid stalling. If every locally-connected user
+disconnects, the subscription set could briefly become empty before a new
+user connects and re-subscribes. Subscribing to a dummy `ws:_keepalive`
+channel at startup — and never unsubscribing — guarantees the listener
+loop stays alive for the life of the process, independent of how many
+real users are connected at any moment.
 
-If any handler raises, we return without ACKing. The message is retried with the
-same handler order. A user who immediately calls `GET /timeline` after receiving
-`NEW_POST` will always find the post there.
+### `is_online()` is now explicitly local-only
 
-### ACK only on full success, not per-handler
+Previously (in the single-worker world) `is_online()` implicitly answered
+"is this user reachable" — true because there was only one worker to check.
+That's no longer true. Rather than pay for a global presence check (a
+Redis lookup per follower on every post, e.g. `GET user:online:{id}`),
+`realtime_consumer` publishes to every follower's channel unconditionally.
+If nobody is subscribed — the user is offline everywhere — Redis discards
+the message with no error and no retry needed. `is_online()` is kept only
+for the debug panel, to show which users are connected to the specific
+worker rendering that panel — it must not be used to gate delivery
+elsewhere.
 
-We could ACK per-handler — fanout ACKs after it completes, realtime ACKs after it
-completes. This would allow partial retries. We chose not to for two reasons:
+### `REALTIME_SKIP` removed
 
-1. We use a single stream entry per event. A partial ACK would require splitting
-   the event into two separate stream entries, one per consumer — adding
-   complexity for a problem that rarely occurs at this scale.
-
-2. Fanout is idempotent. Retrying the full message (both handlers) has no
-   correctness cost and keeps the code simple.
-
-### XAUTOCLAIM runs before XREADGROUP on every loop iteration
-
-```python
-while True:
-    await self._reclaim_pending()   # ← retry stale work first
-    results = await self._client.xreadgroup(...)  # ← then read new work
-```
-
-This ordering ensures that recovery work is never starved by a stream of new
-messages. If the consumer restarts with a backlog of 50 unACKed messages, it
-processes those before taking on new ones.
-
-### Malformed messages are ACKed immediately
-
-If a message cannot be parsed (bad JSON), retrying it forever accomplishes
-nothing. We ACK and discard it immediately:
-
-```python
-except json.JSONDecodeError:
-    await self._client.xack(stream_key, _GROUP_NAME, msg_id)
-    return  # discard — do not retry
-```
-
-In a more mature system these would be routed to a dead-letter queue for manual
-inspection. That is deferred to a later milestone.
-
-### Stream length is bounded with approximate trimming
-
-```python
-await r.xadd(stream_key, {"data": json.dumps(payload)},
-             maxlen=STREAM_MAX_LEN, approximate=True)
-```
-
-`approximate=True` (the `~` prefix in Redis CLI notation) means Redis trims at
-the nearest internal node boundary rather than an exact count. This avoids
-rewriting internal nodes on every `XADD`, making writes significantly faster.
-The actual stream length may temporarily exceed `STREAM_MAX_LEN` by a small
-margin — acceptable for this use case.
-
-A `STREAM_MAX_LEN` of 10 000 events is enough to cover a multi-hour outage at
-typical write rates for 800–1000 users.
+This debug event existed to show "follower X is offline, notification
+skipped." Since delivery is no longer conditional on a known online
+check, there's nothing to report as skipped — a message is either
+delivered (a worker was subscribed) or silently dropped by Redis with no
+visibility into which case occurred. This is an acceptable loss of debug
+granularity for the correctness gain.
 
 ---
 
 ## What was built
 
-### New files
-
-```
-test_streams.py     — standalone XACK/XAUTOCLAIM lifecycle verification
-                    (does not require the server to be running)
-```
-
 ### Modified files
-
 ```
 backend/
-  event_bus.py      — full replacement (XADD/XREADGROUP/XACK/XAUTOCLAIM)
-  config.py         — STREAM_MAX_LEN, STREAM_RECLAIM_MS
+ws_manager.py — ConnectionManager: init()/close() lifecycle, dedicated
+Pub/Sub client, _listen() background task, per-user
+channel subscribe/unsubscribe on connect/disconnect
+consumers.py — realtime_consumer: publishes to all followers
+unconditionally; is_online() used for debug context only
+app.py — lifespan: manager.init(REDIS_URL) before accepting
+connections, manager.close() on shutdown
 ```
 
-### Unchanged files
+### Unchanged
 
-Everything else. The public interface of `RedisStreamsEventBus` is identical to
-`RedisPubSubEventBus`:
-
-```python
-await bus.init(REDIS_URL)
-bus.subscribe("PostCreated", fanout_consumer)
-bus.subscribe("PostCreated", realtime_consumer)
-listener = asyncio.create_task(bus.listen())
-# ... server runs ...
-await bus.close()
-```
-
-`app.py`, `consumers.py`, `db.py`, `cache.py`, `auth.py`, and all frontend
-files require zero changes.
-
----
-
-## Stream structure
-
-```
-Stream key:   ff:stream:PostCreated
-Group name:   ff_consumers
-Consumer:     worker-{pid}        ← unique per process
-
-Message format:
-  id:    1234567890123-0           (Redis-generated timestamp + sequence)
-  data:  {"post_id": "a1b2c3d4",
-          "author_id": "alice",
-          "author_name": "Alice",
-          "created_at": 1720000000.0}
-```
-
-One stream per event type. A single consumer group means every message is
-delivered to the group exactly once — whichever consumer instance reads it
-first. For the current single-process deployment this is equivalent to the
-old Pub/Sub behaviour, with the addition of persistence and retry.
+`event_bus.py`, `db.py`, `cache.py`, `auth.py`, `fanout_consumer`, and all
+frontend files require zero changes — this milestone only touches the
+notification delivery path, not fanout or the event bus itself.
 
 ---
 
 ## Request flow comparison
 
-### Before (Milestone 1 — Redis Pub/Sub)
+### Before (Milestone 2 — direct send, single-worker only)
 
 ```
-POST /posts
-    │
-    ├─ db.create_post()         → PostgreSQL ✓ (durable)
-    ├─ system.broadcast()       → WebSocket debug panel
-    └─ redis.publish()          → Pub/Sub broadcast
-                │
-                ▼
-         ┌──────────────┐
-         │  listen()    │  ← if this isn't running, event is LOST
-         └──────┬───────┘
-                │
-           fanout + realtime (if received)
+realtime_consumer
+│
+└─► manager.send(user_id, data)
+│
+└─► local dict lookup → ws.send_json()
+(works only if user_id's socket is in THIS process)
 ```
 
-### After (Milestone 2 — Redis Streams)
+### After (Milestone 3 — Redis Pub/Sub routing)
 
 ```
-POST /posts
-    │
-    ├─ db.create_post()         → PostgreSQL ✓ (durable)
-    ├─ system.broadcast()       → WebSocket debug panel
-    └─ redis.xadd()             → Stream ✓ (durable)
-                │
-         message persists in stream
-                │
-         ┌──────────────┐
-         │  listen()    │     ← if this restarts, XAUTOCLAIM recovers the message
-         └──────┬───────┘
-                │
-           _reclaim_pending() → XAUTOCLAIM
-           xreadgroup()       → new messages
-                │
-           fanout_consumer    → ZADD ✓ (idempotent on retry)
-           realtime_consumer  → WebSocket push (best-effort)
-                │
-           xack()             → message leaves pending list
-```
-
----
-
-## Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `STREAM_MAX_LEN` | `10000` | Max entries per stream (approximate trim) |
-| `STREAM_RECLAIM_MS` | `30000` | Idle ms before XAUTOCLAIM reclaims a message |
-
-Lower `STREAM_RECLAIM_MS` during development to speed up retry observations:
-
-```env
-STREAM_RECLAIM_MS=5000   # 5 s during testing; restore to 30000 for production
+realtime_consumer (any worker)
+│
+└─► redis.publish("ws:notify:{user_id}", json)
+│
+every worker's _listen() task receives the message
+(all subscribed to ws:notify:* for their locally-held users)
+│
+only the worker with a local dict entry for user_id
+finds the socket and forwards it — others no-op silently
 ```
 
 ---
 
 ## Verification
 
-### Standalone (no server required)
-
-```bash
-# Optionally set a short reclaim window for faster observation
-echo "STREAM_RECLAIM_MS=3000" >> .env
-
-python test_streams.py
-```
-
-Expected output:
-
-```
-[1] XADD — write message to stream
-    msg_id: 1720000000000-0
-
-[2] XREADGROUP — read without ACKing (simulated crash)
-    Received: 1720000000000-0
-    ↳ NOT calling XACK — message stays in pending list
-
-[3] XPENDING — confirm message is in pending list
-    msg_id:       1720000000000-0
-    consumer:     test-script
-    idle (ms):    12
-    deliveries:   1
-    ✅  Message is in the pending list — it will NOT be lost
-
-[4] XAUTOCLAIM — reclaim after 3 s idle
-    Reclaimed 1 message(s):
-    ↺  1720000000000-0 → {"post_id": "test-xack-001" ...
-    ✅  XAUTOCLAIM recovered the unACKed message for retry
-
-[5] XACK — acknowledge the message (success path)
-    ACKed 1 message(s)
-
-[6] XPENDING — confirm pending list is now clear
-    ✅  Pending list is empty — full lifecycle verified
-```
-
-### Retry path (with server running)
-
-1. Set `STREAM_RECLAIM_MS=5000` in `.env`
-2. Add `raise Exception("test")` at the top of `fanout_consumer`
-3. Restart server, make a post
-4. Observe in logs:
-   ```
-   [EventBus] Handler error on 'PostCreated' msg ...: Exception('test')
-              Will retry after 5 s
-   ```
-5. Remove the `raise`, restart server
-6. Within 5 seconds:
-   ```
-   [EventBus] Reclaiming stale message ... on 'PostCreated'
-   ```
-7. Fanout runs, timelines updated, message ACKed
-
-### Restart path
-
-1. Make a post
-2. Stop the server immediately (Ctrl+C)
-3. Restart
-4. `XAUTOCLAIM` recovers the in-flight message on next reclaim cycle
-5. Follower timelines are updated correctly
-6. **Users who reconnect see the post — but receive no push notification**
-   (see Known Limitations below)
-
-### Redis CLI inspection
-
-```bash
-# Connect to your Redis instance
-redis-cli -u "$REDIS_URL"
-
-# Messages in the stream
-XLEN ff:stream:PostCreated
-
-# Pending messages for the consumer group
-XPENDING ff:stream:PostCreated ff_consumers - + 10
-
-# Group summary: pending count, last delivery ID
-XINFO GROUPS ff:stream:PostCreated
-
-# Consumer summary: messages in flight per consumer
-XINFO CONSUMERS ff:stream:PostCreated ff_consumers
-```
-
----
-
-## Verification checklist
-
-- [ ] `test_streams.py` runs to completion with all steps showing ✅
-- [ ] Normal post: `XPENDING` is empty after fanout completes
-- [ ] Injected failure: retry loop visible in logs every `STREAM_RECLAIM_MS`
-- [ ] Retry recovery: fixing the handler causes message to process and ACK
-- [ ] Restart recovery: in-flight message is reclaimed and fanout runs on restart
-- [ ] Duplicate safety: posting the same event twice leaves no duplicate in timeline
-- [ ] `XINFO GROUPS` shows `0` pending after a clean run
+- Single worker: post → author's own timeline updates without a reload,
+  all followers receive `NEW_POST` immediately
+- Two workers (ports 8001 / 8002), two browser sessions on different
+  frontend ports connected to different backends: posting from a user on
+  worker A correctly notifies a follower connected to worker B
+- `inspect_stream.py` confirms the event bus itself is healthy throughout:
+  `XLEN` increments per post, pending list empties after processing, `lag`
+  returns to 0 — ruling out event-bus issues as a cause of any earlier
+  delivery failures observed during this milestone's development
 
 ---
 
 ## Known limitations
 
-### WebSocket notifications are not recovered after restart
+### `SystemBroadcaster` (debug panel) is still per-worker
 
-After a server restart, `XAUTOCLAIM` correctly retries `fanout_consumer` — Redis
-sorted set writes are idempotent and timelines are accurate. However,
-`realtime_consumer` queries `ConnectionManager.is_online()`, which reflects the
-state of the current process only. Because all WebSocket connections are held in
-in-process memory, a restarted server has an empty `ConnectionManager`. All
-followers appear offline. `REALTIME_SKIP` fires for every follower, and no push
-notification is sent.
+`/ws/events` clients only see events broadcast by the worker that
+happened to process a given post. In multi-worker setups, a `PostCreated`
+event is consumed by exactly one worker (Redis Streams consumer groups
+deliver to one consumer per message), so only clients connected to *that*
+worker's `/ws/events` endpoint see the corresponding `FANOUT_START`,
+`FANOUT_WRITE`, `REALTIME_START`, `REALTIME_SEND` entries. Single-worker
+setups appear unaffected only because there's nothing to partition.
 
-Users who reconnect after a restart see the correct timeline via `GET /timeline`,
-but they receive no `NEW_POST` WebSocket event for posts that were in-flight at
-restart time. **This is the expected behaviour of a single-process WebSocket
-layer**, not a bug introduced by this milestone.
-
-Mitigation: users see the post immediately on reconnect/refresh. The timeline
-is the source of truth; WebSocket is a notification convenience.
-
-Resolution: Milestone 3.
-
-### No dead-letter queue for persistently failing messages
-
-A message that always causes a handler exception will be retried indefinitely.
-The current mitigation is a log line per retry. A dead-letter stream
-(`ff:stream:dead-letter`) that receives messages exceeding a maximum delivery
-count (e.g., `times_delivered > 5`) would make persistent failures visible and
-actionable. This is deferred to a later operational milestone.
+This is a debug/observability tool, not part of the user-facing feed
+path, so it's documented rather than fixed here. The fix would follow the
+exact same pattern as `ConnectionManager` — a `ws:debug-events` Pub/Sub
+channel that every worker subscribes to and rebroadcasts locally — but
+that work is deferred rather than bundled into this milestone.
 
 ---
 
-## Scaling ceiling unchanged
+## Next milestone — Milestone 4: Separate consumer process
 
-Redis Streams adds negligible overhead per publish: one `XADD` and one `XACK`
-per `PostCreated` event. At 800–1000 users and typical write rates (< 30
-posts/second), stream throughput is well within the headroom of any hosted Redis
-instance. The scaling limits identified in Milestone 0.5 are unchanged.
+**Problem:** `fanout_consumer` and `realtime_consumer` run inside the same
+process as the HTTP server, competing with API request handling for the
+same asyncio event loop. A large fanout (a user with thousands of
+followers) can introduce latency spikes on unrelated concurrent API calls.
 
----
+**Solution:** Move event consumption into a separate background worker
+process. The HTTP process only publishes to Redis Streams; a dedicated
+worker process (or several) runs `XREADGROUP` and executes the consumers
+independently.
 
-## Next milestone — Milestone 3: WebSocket cross-worker routing
-
-**Problem:** The restart test made the structural limit explicit. `ConnectionManager`
-is a Python dict living in one process's memory. A server restart empties it. Two
-uvicorn workers each have their own `ConnectionManager` with no knowledge of
-connections held by the other. If worker 1 processes a `PostCreated` event and
-Alice's WebSocket is connected to worker 2, Alice receives no notification.
-
-**Solution:** Route WebSocket notifications through Redis Pub/Sub per user:
-
-```
-realtime_consumer
-    │
-    └─► redis.publish("ws:notify:alice", json)
-                │
-         Worker 1 subscribes to "ws:notify:alice"
-         (because alice is connected to worker 1)
-                │
-         Finds alice in its local ConnectionManager
-         Sends NEW_POST over her WebSocket
-```
-
-When a user connects, their `user_id` is registered in Redis along with the
-worker identity. On disconnect, it is removed. The consumer publishes to the
-Redis channel; the correct worker receives it and forwards it to the WebSocket.
-
-**What it unlocks:** Running 2–4 uvicorn workers behind Nginx, notifications
-surviving server restarts (reconnected clients are on the new worker's
-`ConnectionManager` within milliseconds), and the architectural foundation for
-independently scaling the HTTP and WebSocket layers.
+**What it unlocks:** Independent scaling of the API layer and the
+processing layer — e.g. 2 HTTP workers and 1 fanout worker, tuned
+according to which one is actually the bottleneck. This is the point
+where the system starts to resemble a genuine service-oriented
+architecture rather than a monolith with background tasks.
