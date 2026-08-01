@@ -18,7 +18,6 @@ Teardown is the reverse: cancel listener first so no new events are
 processed while the connections below it are closing.
 """
 
-import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -39,7 +38,6 @@ from app.auth import (
     verify_password,
 )
 from app.config import DATABASE_URL, REDIS_URL, REFRESH_TOKEN_EXPIRE_DAYS
-from app.consumers import fanout_consumer, realtime_consumer
 from app.event_bus import bus
 from app.ws_manager import manager, system
 
@@ -50,35 +48,23 @@ _SEED_PASSWORD = "password123"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Storage
     await db.init_db(DATABASE_URL)
     await cache.init_cache(REDIS_URL)
 
-    # Event bus (Redis Streams)
+    # Event bus — HTTP process only publishes (XADD) now. Consumption
+    # (XREADGROUP / listen()) moved to worker.py as a separate process.
+    # bus.init() is still required here: publish() uses the same client.
     await bus.init(REDIS_URL)
-    bus.subscribe("PostCreated", fanout_consumer)
-    bus.subscribe("PostCreated", realtime_consumer)
 
-    # WebSocket router (Redis Pub/Sub) — Milestone 3
     await manager.init(REDIS_URL)
 
-    # Seed default passwords for seed users (idempotent)
     hashed = hash_password(_SEED_PASSWORD)
     for uid in ("alice", "bob", "carol", "dave"):
         await db.set_password_hash(uid, hashed)
 
-    # Start event stream listener
-    listener = asyncio.create_task(bus.listen())
     print(f"✅  All systems ready  (seed password: {_SEED_PASSWORD!r})")
 
-    yield  # ← server runs here
-
-    # Teardown (reverse order)
-    listener.cancel()
-    try:
-        await listener
-    except asyncio.CancelledError:
-        pass
+    yield
 
     await manager.close()  # stop Pub/Sub listener, disconnect Redis
     await bus.close()

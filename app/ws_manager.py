@@ -83,9 +83,9 @@ class ConnectionManager:
                 pass
         if self._pubsub:
             await self._pubsub.unsubscribe()
-            await self._pubsub.aclose()
+            await self._pubsub.close()
         if self._redis:
-            await self._redis.aclose()
+            await self._redis.close()
 
     # Connection lifecycle
 
