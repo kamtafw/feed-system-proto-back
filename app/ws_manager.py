@@ -31,6 +31,7 @@ Why a keepalive channel?
 
 import asyncio
 import json
+import os
 from typing import Dict, List, Optional
 
 import redis.asyncio as aioredis
@@ -94,14 +95,29 @@ class ConnectionManager:
         self._connections[user_id] = ws
         # Subscribe so this worker receives notifications for this user
         await self._pubsub.subscribe(f"{_NOTIFY_PREFIX}{user_id}")
-        print(f"[WS] {user_id} connected  " f"(pid={__import__('os').getpid()}, " f"{len(self._connections)} local connections)")
+        print(f"[WS] {user_id} connected  (pid={os.getpid()}, {len(self._connections)} local connections)")
 
-    def disconnect(self, user_id: str) -> None:
+    def disconnect(self, user_id: str, ws: WebSocket) -> None:
+        """
+        Remove a connection — but only if `ws` is still the one on record
+        for user_id.
+
+        Why this guard exists: connect() overwrites self._connections[user_id]
+        on a second connection (e.g. a second tab) without closing the first.
+        The first socket is orphaned but stays open until IT closes too — at
+        which point ITS exception handler also calls disconnect(user_id).
+        Without checking identity, that stale call would pop whatever is
+        CURRENTLY stored (by then, the live connection) and unsubscribe the
+        shared channel — silently killing notification delivery for a
+        connection that never actually closed, with no error anywhere.
+        """
+        if self._connections.get(user_id) is not ws:
+            # A stale/orphaned connection closed. The active one for this
+            # user_id is untouched — nothing to clean up.
+            return
         self._connections.pop(user_id, None)
-        # Unsubscribe asynchronously — disconnect() is called from exception
-        # handlers where we can't await, so fire-and-forget is correct here.
         asyncio.create_task(self._pubsub.unsubscribe(f"{_NOTIFY_PREFIX}{user_id}"))
-        print(f"[WS] {user_id} disconnected  " f"(pid={__import__('os').getpid()}, " f"{len(self._connections)} local connections)")
+        print(f"[WS] {user_id} disconnected  (pid={os.getpid()}, {len(self._connections)} local connections)")
 
     def is_online(self, user_id: str) -> bool:
         """
@@ -160,6 +176,8 @@ class ConnectionManager:
             user_id = channel.removeprefix(_NOTIFY_PREFIX)
             ws = self._connections.get(user_id)
 
+            print(f"[PUBSUB]" f" channel={channel}" f" user={user_id}" f" ws={id(ws) if ws else None}")
+
             if ws is None:
                 # User disconnected between the publish and this delivery
                 continue
@@ -167,8 +185,9 @@ class ConnectionManager:
             try:
                 await ws.send_text(message["data"])
             except Exception:
-                # WebSocket is stale — clean up and unsubscribe
-                self.disconnect(user_id)
+                # WebSocket is stale — clean up and unsubscribe (only if this
+                # is still the active connection for user_id)
+                self.disconnect(user_id, ws)
 
 
 class SystemBroadcaster:

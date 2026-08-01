@@ -235,6 +235,56 @@ count looks alarming during debugging.
 
 ---
 
+## Post-merge fix: stale connection could evict a live one
+
+**Discovered during:** the two-worker consumer-group experiment
+(see "Next milestone" section above), while testing multi-tab behavior
+for the same user account.
+
+**The bug:** `ConnectionManager.disconnect(user_id)` looked up and popped
+whatever WebSocket was *currently* stored for `user_id`, regardless of
+which physical connection had actually closed. Since `connect()`
+overwrites `self._connections[user_id]` on a second connection (e.g. a
+second browser tab logging into the same account) without closing the
+first, the first connection becomes orphaned but stays open — still
+blocked on `await ws.receive_text()` — until its tab is closed.
+
+When that orphaned tab was eventually closed, its `WebSocketDisconnect`
+handler called `disconnect(user_id)`, which popped whatever was
+*currently* in the dict — by then, the second (live, actively used)
+connection — and unsubscribed `ws:notify:{user_id}` on Redis entirely.
+The live tab's WebSocket stayed open and looked completely healthy, but
+silently stopped receiving any notifications, with no error on either
+side. Confirmed via targeted logging of connection identity
+(`id(ws)`) across `connect()`/`disconnect()`/`_listen()`.
+
+**The fix:** `disconnect()` now takes the specific `WebSocket` instance
+being closed, and only acts if it's still the one on record:
+
+    if self._connections.get(user_id) is not ws:
+        return  # stale connection closing — active one untouched
+
+This does not add multi-device support — it only ensures a stale
+connection closing can never affect an unrelated live one. "Last
+connection wins" is still the model: opening a second tab still silently
+takes over routing from the first, and the first tab receives nothing
+from that point on while it remains open. See known limitation below.
+
+## Known limitation (carried forward): single connection per user
+
+`ConnectionManager._connections` is `Dict[str, WebSocket]` — one socket
+per `user_id`. Multiple simultaneous connections for the same account
+(multiple tabs, multiple devices) are not supported: the most recent
+connection silently becomes the only one that receives notifications.
+This matches how a lot of prototypes start, but real multi-device
+support (the pattern Slack/WhatsApp Web use) requires `Dict[str,
+Set[WebSocket]]`, forwarding to every live connection, and
+reference-counted Pub/Sub subscribe/unsubscribe (only unsubscribe from
+`ws:notify:{user_id}` once the set is empty, not on every individual
+disconnect). Deferred — not in scope for the current milestone set.
+
+---
+
 ## Next milestone — Milestone 5: Post cache
 
 **Problem:** Every timeline read fetches post bodies from PostgreSQL with

@@ -335,4 +335,4 @@ async def feed_ws(
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        manager.disconnect(user_id, ws)

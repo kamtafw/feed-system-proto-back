@@ -11,5 +11,6 @@
 		"xlen",
 		"XPENDING",
 		"xreadgroup"
-	]
+	],
+	"python-envs.defaultEnvManager": "ms-python.python:system"
 }
