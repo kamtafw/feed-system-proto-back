@@ -1,217 +1,256 @@
-# Milestone 3 — WebSocket Cross-Worker Routing
+# Milestone 4 — Separate Consumer Process
 
-## FanoutFeed · `milestone-3-ws-routing`
+## FanoutFeed · `milestone-4-worker-process`
 
 ---
 
 ## Goal
 
-Make real-time `NEW_POST` notifications reach a user regardless of which
-uvicorn worker holds their WebSocket connection, so the HTTP layer can run
-more than one worker process.
+Move event processing (`fanout_consumer`, `realtime_consumer`) out of the
+HTTP server process into a standalone worker process, so the two can be
+scaled, restarted, and reasoned about independently.
 
 ---
 
 ## Previous architecture and its limitation
 
-`ConnectionManager` held a plain Python dict mapping `user_id → WebSocket`.
-`realtime_consumer` called `manager.send()`, which looked up the socket in
-that dict and called `ws.send_json()` directly.
+Since Milestone 2, `bus.listen()` ran as an `asyncio.Task` inside the
+same process as the FastAPI HTTP server, started from the `lifespan`
+context manager. Every HTTP worker process was, incidentally, also a
+Redis Streams consumer registered in `ff_consumers`.
 
-```
-realtime_consumer
-│
-└─► manager.send(user_id, data)
-│
-└─► self._connections[user_id].send_json(data)
-```
+This was invisible with a single HTTP worker. It became concrete evidence
+during Milestone 3 testing: `XINFO GROUPS` showed the `consumers` count
+climbing on every `uvicorn --reload` cycle (23 → 25 → 28 across
+successive checks). Each reload spawned a new process, which registered
+a new `worker-{pid}` consumer name — proof that request-handling
+capacity and event-processing capacity were coupled to the same process
+lifecycle, even though nothing about their actual workloads requires
+that.
 
-This only works if the consumer and the target's WebSocket live in the
-same process. With a single worker this was invisible — everything is in
-one process by definition. The moment a second worker is introduced,
-whichever worker's event-loop happened to consume the `PostCreated`
-message from the Streams consumer group is not necessarily the worker
-holding the follower's socket. That follower's local dict has no entry,
-`manager.send()` silently no-ops, and the notification is lost.
+The two have genuinely independent bottlenecks:
 
-This was the structural blocker to horizontal scaling of the HTTP layer —
-running 2+ workers behind a reverse proxy for more request-handling
-capacity was not possible without this fix.
+- HTTP layer: scales with concurrent request volume
+- Consumer layer: scales with fanout size (a user with thousands of
+  followers) and event throughput
+
+Coupling them means you can't add HTTP capacity without also adding
+consumer capacity, and vice versa — the wrong lever moves every time you
+pull it.
 
 ---
 
-## Why Redis Pub/Sub for routing
+## Why a standalone process (not ARQ/SAQ)
 
-The same pattern already exists between `bus.publish()` and worker
-processes for `PostCreated` — Redis as the shared intermediary that every
-process can reach. Pub/Sub (not Streams) is the right primitive here
-specifically *because* durability is not required: a missed notification
-just means the user sees the post on their next reconnect or refresh,
-same as any offline user under Fanout-on-Write. There's no need to retry
-or persist a "user wasn't listening" event.
+The project's roadmap originally listed ARQ, SAQ, or a custom asyncio
+reader as candidates. ARQ and SAQ are job queues — one job, one worker,
+retry semantics scoped to a single unit of work.
 
-```
-realtime_consumer (on any worker)
-│
-└─► redis.publish("ws:notify:alice", json)
-│
-Worker A subscribes to "ws:notify:alice"
-(because alice is connected to Worker A)
-│
-Finds alice in its local connection dict
-Sends NEW_POST over her WebSocket
-```
+`PostCreated` isn't a single job. It requires two independent handlers
+(fanout, realtime) to both run in a fixed order, with one ACK gating
+both — the exact guarantee `RedisStreamsEventBus` was built for in
+Milestone 2, specifically to prevent the read-your-own-writes race
+between the timeline write and the WebSocket push. Splitting into a job
+queue would mean enqueuing fanout and realtime as separate jobs and
+losing that guarantee entirely — a regression, not a sidegrade.
 
-Think of it as a hotel intercom: each floor (worker) manages its own
-rooms (connections), but every floor shares the same switchboard (Redis)
-to route a call to the right room regardless of which floor placed it.
+So the correct move is not a new library — it's just moving *where*
+`RedisStreamsEventBus.listen()` runs. The consumers, the event bus, and
+the sequential-ACK contract are completely unchanged.
 
 ---
 
 ## Design decisions
 
-### Per-user channels, not a single broadcast channel
+### `worker.py` reuses every existing component unmodified
 
-Publishing to `ws:notify:{user_id}` rather than one shared channel means
-each worker only subscribes to channels for users it actually holds —
-Worker A doesn't receive (and discard) every notification in the system,
-only the ones addressed to its own connected users. This keeps the
-Pub/Sub traffic proportional to local connection count, not global post
-volume.
+`db`, `cache`, `bus`, `manager`, `fanout_consumer`, `realtime_consumer`
+are all the same modules and singletons used by the HTTP process. The
+only new code is the process entry point itself — initialize the same
+dependencies, subscribe the same handlers, call `listen()`. This keeps
+the seam exactly where it should be: at the process boundary, not inside
+any component's logic.
 
-### The `ws:_keepalive` channel
+### The worker also initializes `ConnectionManager`
 
-`redis-py`'s `pubsub.listen()` is a generator that must have at least one
-active subscription to avoid stalling. If every locally-connected user
-disconnects, the subscription set could briefly become empty before a new
-user connects and re-subscribes. Subscribing to a dummy `ws:_keepalive`
-channel at startup — and never unsubscribing — guarantees the listener
-loop stays alive for the life of the process, independent of how many
-real users are connected at any moment.
+`realtime_consumer` calls `manager.send()`, which needs a Redis client to
+publish to `ws:notify:{user_id}`. The worker process calls
+`manager.init()` to get that client — even though it never accepts a
+real browser WebSocket, so the local connections dict and the
+`_listen()` forwarding loop `ConnectionManager` also starts are unused
+overhead in this process. Not a correctness issue, just a slightly
+oversized dependency — a future refactor could split `ConnectionManager`
+into a lean publish-only client and a separate subscribe-and-forward
+component that only the HTTP process needs. Deferred; not required for
+this milestone's goal.
 
-### `is_online()` is now explicitly local-only
+### The HTTP process keeps `bus.init()`
 
-Previously (in the single-worker world) `is_online()` implicitly answered
-"is this user reachable" — true because there was only one worker to check.
-That's no longer true. Rather than pay for a global presence check (a
-Redis lookup per follower on every post, e.g. `GET user:online:{id}`),
-`realtime_consumer` publishes to every follower's channel unconditionally.
-If nobody is subscribed — the user is offline everywhere — Redis discards
-the message with no error and no retry needed. `is_online()` is kept only
-for the debug panel, to show which users are connected to the specific
-worker rendering that panel — it must not be used to gate delivery
-elsewhere.
-
-### `REALTIME_SKIP` removed
-
-This debug event existed to show "follower X is offline, notification
-skipped." Since delivery is no longer conditional on a known online
-check, there's nothing to report as skipped — a message is either
-delivered (a worker was subscribed) or silently dropped by Redis with no
-visibility into which case occurred. This is an acceptable loss of debug
-granularity for the correctness gain.
+`POST /posts` still calls `bus.publish()` (XADD) directly — publishing is
+cheap, synchronous-from-the-caller's-perspective, and has no reason to be
+routed through another process. Only *consumption* (`XREADGROUP` /
+`listen()`) moved. This mirrors how Kafka producers and consumers are
+typically split in production: any process can produce; only designated
+consumer processes read.
 
 ---
 
 ## What was built
 
+### New files
+
+```
+worker.py — standalone process: init dependencies, subscribe handlers,
+run bus.listen() indefinitely
+```
+
 ### Modified files
+
 ```
 backend/
-ws_manager.py — ConnectionManager: init()/close() lifecycle, dedicated
-Pub/Sub client, _listen() background task, per-user
-channel subscribe/unsubscribe on connect/disconnect
-consumers.py — realtime_consumer: publishes to all followers
-unconditionally; is_online() used for debug context only
-app.py — lifespan: manager.init(REDIS_URL) before accepting
-connections, manager.close() on shutdown
+app.py — lifespan: removed bus.subscribe() calls and the
+listener asyncio.Task; bus.init() retained for publish()
+ws_manager.py — ConnectionManager.close(): fixed PubSub.aclose() call
+(doesn't exist on this redis-py version) to close()
 ```
 
 ### Unchanged
 
-`event_bus.py`, `db.py`, `cache.py`, `auth.py`, `fanout_consumer`, and all
-frontend files require zero changes — this milestone only touches the
-notification delivery path, not fanout or the event bus itself.
+`event_bus.py`, `db.py`, `cache.py`, `auth.py`, `consumers.py`, and all
+frontend files — this milestone only changes which process runs the
+consume loop, not any consumer logic or the event bus contract.
 
 ---
 
 ## Request flow comparison
 
-### Before (Milestone 2 — direct send, single-worker only)
+### Before (Milestone 3 — consumer loop inside the HTTP process)
+
 
 ```
-realtime_consumer
+HTTP process
 │
-└─► manager.send(user_id, data)
+├─ POST /posts → bus.publish() (XADD)
 │
-└─► local dict lookup → ws.send_json()
-(works only if user_id's socket is in THIS process)
+└─ asyncio.Task: bus.listen()
+│
+├─ fanout_consumer
+└─ realtime_consumer
 ```
 
-### After (Milestone 3 — Redis Pub/Sub routing)
+### After (Milestone 4 — consumer loop in a separate process)
 
 ```
-realtime_consumer (any worker)
+HTTP process
 │
-└─► redis.publish("ws:notify:{user_id}", json)
+└─ POST /posts → bus.publish() (XADD)
 │
-every worker's _listen() task receives the message
-(all subscribed to ws:notify:* for their locally-held users)
+▼
+┌───────────────┐
+│ Redis │
+│ stream, group,│
+│ Pub/Sub │
+└───────────────┘
 │
-only the worker with a local dict entry for user_id
-finds the socket and forwards it — others no-op silently
+▼
+worker.py (separate process)
+│
+└─ bus.listen()
+│
+├─ fanout_consumer
+└─ realtime_consumer
 ```
+The only connection between the two processes is Redis itself — the
+stream, the consumer group, and the Pub/Sub channels. Neither process
+holds a direct reference to the other.
 
 ---
 
 ## Verification
 
-- Single worker: post → author's own timeline updates without a reload,
-  all followers receive `NEW_POST` immediately
-- Two workers (ports 8001 / 8002), two browser sessions on different
-  frontend ports connected to different backends: posting from a user on
-  worker A correctly notifies a follower connected to worker B
-- `inspect_stream.py` confirms the event bus itself is healthy throughout:
-  `XLEN` increments per post, pending list empties after processing, `lag`
-  returns to 0 — ruling out event-bus issues as a cause of any earlier
-  delivery failures observed during this milestone's development
+- **Both processes running:** post → author's timeline updates
+  immediately, followers receive `NEW_POST`, `inspect_stream.py` shows
+  `lag: 0` and empty `PENDING` after each post — matches the working
+  baseline from Milestone 3.
+- **Worker stopped, then post:** `POST /posts` still returns `200`.
+  `XLEN` grows and `lag` in `XINFO GROUPS` climbs while the worker is
+  down — this is the test that specifically proves the decoupling, since
+  it could not have passed before this milestone (the old architecture
+  had no way to accept a post without the same process also being the
+  consumer).
+- **Worker restarted after an outage:** backlog drains automatically,
+  followers receive delayed `NEW_POST` notifications without
+  reconnecting their WebSocket — confirms recovery is automatic and
+  requires no client-side action.
+- **Extended outage test (~15 min), attempting to probe Pub/Sub
+  idle-disconnect risk:** inconclusive. The access token expired first
+  (15-minute TTL) and produced an unrelated 401. A shorter-gap retest
+  succeeded with no message loss. This risk remains a named, unconfirmed
+  concern rather than something proven safe or proven broken — see Known
+  Limitations.
 
 ---
 
 ## Known limitations
 
-### `SystemBroadcaster` (debug panel) is still per-worker
+### Pub/Sub idle-disconnect risk on the HTTP process (unconfirmed)
 
-`/ws/events` clients only see events broadcast by the worker that
-happened to process a given post. In multi-worker setups, a `PostCreated`
-event is consumed by exactly one worker (Redis Streams consumer groups
-deliver to one consumer per message), so only clients connected to *that*
-worker's `/ws/events` endpoint see the corresponding `FANOUT_START`,
-`FANOUT_WRITE`, `REALTIME_START`, `REALTIME_SEND` entries. Single-worker
-setups appear unaffected only because there's nothing to partition.
+`ConnectionManager`'s Pub/Sub subscription — used to route
+`ws:notify:{user_id}` messages to the correct locally-held WebSocket —
+runs on a long-lived Redis connection in the HTTP process. Hosted Redis
+providers commonly enforce idle-connection timeouts. If that connection
+were silently dropped server-side during an extended period with no
+Pub/Sub traffic, `realtime_consumer`'s `PUBLISH` call would still succeed
+(Redis accepts the write regardless of subscriber state) while the
+message never reaches the HTTP process, because its subscription no
+longer exists. Neither side would log an error — Pub/Sub delivery
+failure is silent by design.
 
-This is a debug/observability tool, not part of the user-facing feed
-path, so it's documented rather than fixed here. The fix would follow the
-exact same pattern as `ConnectionManager` — a `ws:debug-events` Pub/Sub
-channel that every worker subscribes to and rebroadcasts locally — but
-that work is deferred rather than bundled into this milestone.
+This was not reproduced during testing to date; a genuine long-outage
+test was compromised by an unrelated access-token expiry. It remains an
+open architectural question rather than a confirmed defect. A persistent
+notification store (planned for Milestone 8) would remove this risk
+entirely by making the WebSocket push a hint that a notification exists,
+rather than the sole mechanism for delivering it — the same pattern
+already used for the timeline itself, where WebSocket is a convenience
+and PostgreSQL/Redis remain the source of truth.
+
+### Stale consumer entries accumulate in `ff_consumers`
+
+On Windows, `Ctrl+C` raises `KeyboardInterrupt` directly inside the
+proactor event loop's I/O polling call, without resuming the currently
+running task to let it reach a `finally` block. This means `worker.py`'s
+cleanup path (`manager.close()`, `bus.close()`, etc.) does not run on a
+non-graceful shutdown, and each restart registers a new
+`worker-{os.getpid()}` name in the `ff_consumers` group that is never
+explicitly removed via `XGROUP DELCONSUMER`.
+
+This is cosmetic, not functional: `XAUTOCLAIM`'s reclaim logic operates
+purely on message idle-time, regardless of whether the original consumer
+name was ever cleanly deregistered. Pending-message recovery and retry
+correctness are unaffected. It does mean `XINFO GROUPS`'s `consumers`
+count is not a reliable indicator of currently-live consumer processes
+during local development — a fact worth remembering the next time that
+count looks alarming during debugging.
 
 ---
 
-## Next milestone — Milestone 4: Separate consumer process
+## Next milestone — Milestone 5: Post cache
 
-**Problem:** `fanout_consumer` and `realtime_consumer` run inside the same
-process as the HTTP server, competing with API request handling for the
-same asyncio event loop. A large fanout (a user with thousands of
-followers) can introduce latency spikes on unrelated concurrent API calls.
+**Problem:** Every timeline read fetches post bodies from PostgreSQL with
+`WHERE id = ANY(...)`. At current traffic this is fast, but the same
+popular post gets re-fetched from Postgres on every timeline it appears
+in — redundant reads that scale with view count, not post count.
 
-**Solution:** Move event consumption into a separate background worker
-process. The HTTP process only publishes to Redis Streams; a dedicated
-worker process (or several) runs `XREADGROUP` and executes the consumers
-independently.
+**Solution:** Serialize the full post object into a Redis hash
+(`post:{post_id}`) on creation. Timeline reads check Redis first, falling
+back to PostgreSQL only on a cache miss.
 
-**What it unlocks:** Independent scaling of the API layer and the
-processing layer — e.g. 2 HTTP workers and 1 fanout worker, tuned
-according to which one is actually the bottleneck. This is the point
-where the system starts to resemble a genuine service-oriented
-architecture rather than a monolith with background tasks.
+**What it unlocks:** PostgreSQL read traffic for timeline fetches drops
+sharply, leaving it to handle writes, follow/unfollow, and occasional
+cache misses — the standard read-through cache pattern.
+
+**Planned experiment before M5:** run a second `worker.py` instance
+alongside the first and observe how Redis Streams' consumer group splits
+message delivery between them — direct, hands-on confirmation of the
+horizontal scaling this milestone's separation was built to unlock.
