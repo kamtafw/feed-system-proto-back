@@ -27,3 +27,10 @@ STREAM_MAX_LEN  = int(os.getenv("STREAM_MAX_LEN",  "10000"))
 # 30 s is generous — fanout for 1000 followers at 1 ms/write takes < 1 s.
 # Tune down if you want faster retry; tune up if consumers are legitimately slow.
 STREAM_RECLAIM_MS = int(os.getenv("STREAM_RECLAIM_MS", "30000"))
+
+# Post cache (Milestone 5)
+# TTL for cached post JSON blobs. Redis is a performance optimization here,
+# not the source of truth — Postgres remains durable. 24h covers the window
+# where timeline reads overwhelmingly reference recent posts; older posts
+# fall through to Postgres on the rare read and get re-cached then.
+POST_CACHE_TTL_SECONDS = int(os.getenv("POST_CACHE_TTL_SECONDS", "86400"))

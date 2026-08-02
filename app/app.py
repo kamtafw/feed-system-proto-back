@@ -258,7 +258,25 @@ async def create_post(
     created_at = time.time()
     content = body.content.strip()
 
+    post = {
+        "id": post_id,
+        "author_id": author_id,
+        "author_name": user["name"],
+        "content": content,
+        "created_at": created_at,
+    }
+
     await db.create_post(post_id, author_id, user["name"], content, created_at)
+
+    # Best-effort cache warm. Redis is a performance layer not the source
+    # of truth (ADR: architecture-review.md) — Postgres write above already
+    # succeeded. A failure here only costs the "warm on write" latency win
+    # for THIS post; GET /timeline's miss-path repopulates it.
+    try:
+        await cache.set_post(post)
+        print(f"💾  [Cache] warmed post:{post_id}")
+    except Exception as e:
+        print(f"[Cache] Failed to warm cache for post {post_id!r}: {e!r}")
 
     await system.broadcast(
         {
@@ -289,15 +307,31 @@ async def create_post(
 @app.get("/timeline/{user_id}")
 async def get_timeline(user_id: str, limit: int = 50, offset: int = 0):
     """
-    Two-step read:
-        1. Get post IDs from Redis sorted set (fast, ordered)
-        2. Fetch post bodies from PostgreSQL using ANY($1::text[]) (single query)
+    Milestone 5: cache-aside read.
+        1. Redis sorted set → post IDs, newest-first (unchanged)
+        2. MGET the post cache for those IDs
+        3. Postgres ANY($1::text[]) ONLY for misses, then backfill
 
-    The Redis step is O(log n + limit). The Postgres step is one indexed scan.
-    Total cost is effectively constant regardless of timeline length.
+    Full cache miss degrades gracefully to exactly the pre-M5 behavior.
     """
     post_ids = await cache.get_timeline_ids(user_id, limit=limit, offset=offset)
-    return await db.get_posts_by_ids(post_ids)
+    if not post_ids:
+        return []
+
+    cached = await cache.get_posts(post_ids)
+    missing_ids = [pid for pid in post_ids if pid not in cached]
+
+    print(f"💾  [Cache] timeline/{user_id}: {len(cached)} hit(s), {len(missing_ids)} miss(es)")
+
+    if missing_ids:
+        db_posts = await db.get_posts_by_ids(missing_ids)
+        try:
+            await cache.set_posts(db_posts)
+        except Exception as e:
+            print(f"[Cache] Failed to backfill {len(db_posts)} post(s): {e!r}")
+        cached.update({post["id"]: post for post in db_posts})
+
+    return [cached[pid] for pid in post_ids if pid in cached]
 
 
 # WebSockets
