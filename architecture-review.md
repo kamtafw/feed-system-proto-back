@@ -1,306 +1,204 @@
-# Milestone 4 — Separate Consumer Process
+# Milestone 5 — Post Cache
 
-## FanoutFeed · `milestone-4-worker-process`
+## FanoutFeed · `milestone-5-post-cache`
 
 ---
 
 ## Goal
 
-Move event processing (`fanout_consumer`, `realtime_consumer`) out of the
-HTTP server process into a standalone worker process, so the two can be
-scaled, restarted, and reasoned about independently.
+Reduce Postgres read load on `GET /timeline/{user_id}` by caching post
+bodies in Redis, converting the timeline read into a cache-aside pattern.
 
 ---
 
 ## Previous architecture and its limitation
 
-Since Milestone 2, `bus.listen()` ran as an `asyncio.Task` inside the
-same process as the FastAPI HTTP server, started from the `lifespan`
-context manager. Every HTTP worker process was, incidentally, also a
-Redis Streams consumer registered in `ff_consumers`.
+Since the prototype, timeline reads were a two-step operation:
 
-This was invisible with a single HTTP worker. It became concrete evidence
-during Milestone 3 testing: `XINFO GROUPS` showed the `consumers` count
-climbing on every `uvicorn --reload` cycle (23 → 25 → 28 across
-successive checks). Each reload spawned a new process, which registered
-a new `worker-{pid}` consumer name — proof that request-handling
-capacity and event-processing capacity were coupled to the same process
-lifecycle, even though nothing about their actual workloads requires
-that.
+1. `cache.get_timeline_ids()` — Redis `ZREVRANGE`, post IDs newest-first
+2. `db.get_posts_by_ids()` — Postgres `WHERE id = ANY($1::text[])`
 
-The two have genuinely independent bottlenecks:
+Step 2 is a single indexed batch query — cheap in isolation. The problem
+is frequency, not per-query cost: a popular post gets independently
+re-fetched from Postgres once per follower per timeline read. Read
+volume scales with `views × avg followers per post`, not with distinct
+post count.
 
-- HTTP layer: scales with concurrent request volume
-- Consumer layer: scales with fanout size (a user with thousands of
-  followers) and event throughput
-
-Coupling them means you can't add HTTP capacity without also adding
-consumer capacity, and vice versa — the wrong lever moves every time you
-pull it.
+This is not a felt bottleneck at current traffic — it's introduced
+proactively, per the original roadmap, before it becomes one.
 
 ---
 
-## Why a standalone process (not ARQ/SAQ)
+## Architecture Decision Records
 
-The project's roadmap originally listed ARQ, SAQ, or a custom asyncio
-reader as candidates. ARQ and SAQ are job queues — one job, one worker,
-retry semantics scoped to a single unit of work.
+### ADR-1: Post cache representation — JSON strings, not Redis hashes
 
-`PostCreated` isn't a single job. It requires two independent handlers
-(fanout, realtime) to both run in a fixed order, with one ACK gating
-both — the exact guarantee `RedisStreamsEventBus` was built for in
-Milestone 2, specifically to prevent the read-your-own-writes race
-between the timeline write and the WebSocket push. Splitting into a job
-queue would mean enqueuing fanout and realtime as separate jobs and
-losing that guarantee entirely — a regression, not a sidegrade.
+Decision:  
+Store cached posts as JSON strings (post:{id}) instead of Redis hashes.
 
-So the correct move is not a new library — it's just moving *where*
-`RedisStreamsEventBus.listen()` runs. The consumers, the event bus, and
-the sequential-ACK contract are completely unchanged.
+Status:  
+Accepted (Milestone 5)
 
----
+Reason:  
+Timeline reads are bulk fetches by post ID list. MGET provides
+efficient single-round-trip batch retrieval for plain string keys;
+there is no equivalent multi-key-multi-hash primitive. Posts are
+immutable (no edit/delete endpoints exist) — there is no field that
+needs atomic, partial updating, which is the scenario hashes exist
+to serve.
 
-## Design decisions
+Tradeoffs:
 
-### `worker.py` reuses every existing component unmodified
+```text
++ Simpler implementation
++ Efficient batch reads (single MGET vs. N pipelined HGETALLs)
++ Fewer Redis commands
+- Entire JSON must be rewritten if any field changes
+- Less efficient for partial-field updates
+```
 
-`db`, `cache`, `bus`, `manager`, `fanout_consumer`, `realtime_consumer`
-are all the same modules and singletons used by the HTTP process. The
-only new code is the process entry point itself — initialize the same
-dependencies, subscribe the same handlers, call `listen()`. This keeps
-the seam exactly where it should be: at the process boundary, not inside
-any component's logic.
+Revisit When:
 
-### The worker also initializes `ConnectionManager`
+- Post editing is introduced
+- Delete/restore is introduced
+- Like/view/comment counters are updated frequently
+- Partial-field mutations become common
 
-`realtime_consumer` calls `manager.send()`, which needs a Redis client to
-publish to `ws:notify:{user_id}`. The worker process calls
-`manager.init()` to get that client — even though it never accepts a
-real browser WebSocket, so the local connections dict and the
-`_listen()` forwarding loop `ConnectionManager` also starts are unused
-overhead in this process. Not a correctness issue, just a slightly
-oversized dependency — a future refactor could split `ConnectionManager`
-into a lean publish-only client and a separate subscribe-and-forward
-component that only the HTTP process needs. Deferred; not required for
-this milestone's goal.
+### ADR-2: Cache writes are best-effort, not part of the durable write path
 
-### The HTTP process keeps `bus.init()`
+Decision:  
+`cache.set_post()` failures on the `POST /posts` write path are logged
+and do not fail the request.
 
-`POST /posts` still calls `bus.publish()` (XADD) directly — publishing is
-cheap, synchronous-from-the-caller's-perspective, and has no reason to be
-routed through another process. Only *consumption* (`XREADGROUP` /
-`listen()`) moved. This mirrors how Kafka producers and consumers are
-typically split in production: any process can produce; only designated
-consumer processes read.
+Status:  
+Accepted (Milestone 5)
+
+Reason:  
+Redis is a performance layer here, not the source of truth —
+PostgreSQL already durably persisted the post before the cache
+write is attempted. The read-miss path (Postgres fallback +
+backfill) fully repopulates the cache on the next read regardless
+of whether the write-path warm succeeded. Failing the user-facing
+request for a cache-layer problem would trade availability for a
+guarantee we don't actually need.
+
+Tradeoffs:
+
+```text
++ POST /posts availability is decoupled from Redis health
++ Consistent with "Redis silently drops on no subscriber" precedent
+already established for Pub/Sub delivery (M3)
+- First few timeline reads after a warm failure hit Postgres before
+the cache self-heals via the miss path
+- Failures are only visible via logs, not surfaced to the caller
+```
+
+Revisit When:
+
+- Redis takes on a correctness-critical responsibility that cannot
+be reconstructed from Postgres (e.g., a write-through store, or
+coordination state) — at that point "best-effort" is the wrong
+default and this decision should be revisited per-responsibility,
+not blanket-reversed.
 
 ---
 
 ## What was built
 
-### New files
-
-```
-worker.py — standalone process: init dependencies, subscribe handlers,
-run bus.listen() indefinitely
-```
-
 ### Modified files
 
-```
+```text
 backend/
-app.py — lifespan: removed bus.subscribe() calls and the
-listener asyncio.Task; bus.init() retained for publish()
-ws_manager.py — ConnectionManager.close(): fixed PubSub.aclose() call
-(doesn't exist on this redis-py version) to close()
+app/cache.py — get_posts() (bulk MGET), set_post(), set_posts()
+(pipelined bulk write for backfill)
+app/config.py — POST_CACHE_TTL_SECONDS (default 86400s / 24h)
+app/app.py — create_post(): warm cache after DB write, before bus.publish(); best-effort, logged on failure
+get_timeline(): cache-aside read (MGET → Postgres fallback for misses → pipelined backfill → merge, preserving sorted-set order)
+```
+
+### New files
+
+```text
+inspect_post_cache.py — direct Redis inspection: view a cached post + TTL, list all cached keys, or evict a key to force a miss on demand (same pattern as inspect_stream.py from Milestone 2)
 ```
 
 ### Unchanged
 
-`event_bus.py`, `db.py`, `cache.py`, `auth.py`, `consumers.py`, and all
-frontend files — this milestone only changes which process runs the
-consume loop, not any consumer logic or the event bus contract.
+`worker.py`, `consumers.py`, `event_bus.py`, `db.py`, `ws_manager.py`, all frontend files — this milestone only touches the read/write seam in `app.py`, plus two new cache functions. No event contract changes, no consumer logic changes.
 
 ---
 
 ## Request flow comparison
 
-### Before (Milestone 3 — consumer loop inside the HTTP process)
-
-
-```
-HTTP process
-│
-├─ POST /posts → bus.publish() (XADD)
-│
-└─ asyncio.Task: bus.listen()
-│
-├─ fanout_consumer
-└─ realtime_consumer
-```
-
-### After (Milestone 4 — consumer loop in a separate process)
+### Before (pre-M5)
 
 ```
-HTTP process
-│
-└─ POST /posts → bus.publish() (XADD)
-│
-▼
-┌───────────────┐
-│ Redis │
-│ stream, group,│
-│ Pub/Sub │
-└───────────────┘
-│
-▼
-worker.py (separate process)
-│
-└─ bus.listen()
-│
-├─ fanout_consumer
-└─ realtime_consumer
+POST /posts → db.create_post() → bus.publish()
+
+GET /timeline/{id}
+├─ cache.get_timeline_ids() (Redis ZREVRANGE)
+└─ db.get_posts_by_ids() (Postgres, ALWAYS, every read)
 ```
-The only connection between the two processes is Redis itself — the
-stream, the consumer group, and the Pub/Sub channels. Neither process
-holds a direct reference to the other.
+
+### After (M5)
+
+```
+POST /posts
+├─ db.create_post()
+├─ cache.set_post() ← NEW, best-effort, before publish()
+└─ bus.publish()
+
+GET /timeline/{id}
+├─ cache.get_timeline_ids() (Redis ZREVRANGE, unchanged)
+├─ cache.get_posts() ← NEW, bulk MGET
+├─ db.get_posts_by_ids() ← ONLY for cache misses
+└─ cache.set_posts() ← NEW, backfill misses for next read
+```
+
+A full cache miss (cold Redis, TTL expiry across the board) degrades to exactly the pre-M5 code path — no new failure mode introduced, just a fast path added on top.
 
 ---
 
 ## Verification
 
-- **Both processes running:** post → author's timeline updates
-  immediately, followers receive `NEW_POST`, `inspect_stream.py` shows
-  `lag: 0` and empty `PENDING` after each post — matches the working
-  baseline from Milestone 3.
-- **Worker stopped, then post:** `POST /posts` still returns `200`.
-  `XLEN` grows and `lag` in `XINFO GROUPS` climbs while the worker is
-  down — this is the test that specifically proves the decoupling, since
-  it could not have passed before this milestone (the old architecture
-  had no way to accept a post without the same process also being the
-  consumer).
-- **Worker restarted after an outage:** backlog drains automatically,
-  followers receive delayed `NEW_POST` notifications without
-  reconnecting their WebSocket — confirms recovery is automatic and
-  requires no client-side action.
-- **Extended outage test (~15 min), attempting to probe Pub/Sub
-  idle-disconnect risk:** inconclusive. The access token expired first
-  (15-minute TTL) and produced an unrelated 401. A shorter-gap retest
-  succeeded with no message loss. This risk remains a named, unconfirmed
-  concern rather than something proven safe or proven broken — see Known
-  Limitations.
+- **Warm read:** `50 hit(s), 0 miss(es)` logged — zero Postgres queries
+  for post bodies on a fully-warm timeline.
+- **Write-path warm:** `💾 [Cache] warmed post:{id}` logged synchronously
+  inside `create_post()`, before the HTTP response. Confirmed via
+  `inspect_post_cache.py <id>` — correct JSON shape, TTL ≈ 86400s.
+- **Organic miss:** creating a new post shifted the top-50 timeline
+  window to include a pre-existing post that had never been read since
+  M5 shipped (and thus was never cached) → `1 miss(es)` logged →
+  Postgres fallback fired → backfilled silently. Confirmed present via
+  `inspect_post_cache.py` afterward.
+- **Manual miss:** `inspect_post_cache.py --evict <id>` → confirmed
+  deleted → subsequent `GET /timeline` (via the frontend) → key
+  reappears with a fresh ≈86400s TTL — confirms the backfill path
+  independent of the organic case above.
 
 ---
 
 ## Known limitations
 
-### Pub/Sub idle-disconnect risk on the HTTP process (unconfirmed)
-
-`ConnectionManager`'s Pub/Sub subscription — used to route
-`ws:notify:{user_id}` messages to the correct locally-held WebSocket —
-runs on a long-lived Redis connection in the HTTP process. Hosted Redis
-providers commonly enforce idle-connection timeouts. If that connection
-were silently dropped server-side during an extended period with no
-Pub/Sub traffic, `realtime_consumer`'s `PUBLISH` call would still succeed
-(Redis accepts the write regardless of subscriber state) while the
-message never reaches the HTTP process, because its subscription no
-longer exists. Neither side would log an error — Pub/Sub delivery
-failure is silent by design.
-
-This was not reproduced during testing to date; a genuine long-outage
-test was compromised by an unrelated access-token expiry. It remains an
-open architectural question rather than a confirmed defect. A persistent
-notification store (planned for Milestone 8) would remove this risk
-entirely by making the WebSocket push a hint that a notification exists,
-rather than the sole mechanism for delivering it — the same pattern
-already used for the timeline itself, where WebSocket is a convenience
-and PostgreSQL/Redis remain the source of truth.
-
-### Stale consumer entries accumulate in `ff_consumers`
-
-On Windows, `Ctrl+C` raises `KeyboardInterrupt` directly inside the
-proactor event loop's I/O polling call, without resuming the currently
-running task to let it reach a `finally` block. This means `worker.py`'s
-cleanup path (`manager.close()`, `bus.close()`, etc.) does not run on a
-non-graceful shutdown, and each restart registers a new
-`worker-{os.getpid()}` name in the `ff_consumers` group that is never
-explicitly removed via `XGROUP DELCONSUMER`.
-
-This is cosmetic, not functional: `XAUTOCLAIM`'s reclaim logic operates
-purely on message idle-time, regardless of whether the original consumer
-name was ever cleanly deregistered. Pending-message recovery and retry
-correctness are unaffected. It does mean `XINFO GROUPS`'s `consumers`
-count is not a reliable indicator of currently-live consumer processes
-during local development — a fact worth remembering the next time that
-count looks alarming during debugging.
+- **Cache-write failures are silent to the caller by design (ADR-2)** —
+  observable only via logs. Acceptable given Redis's role as a
+  performance layer, not source of truth; revisit if that role changes.
+- **No cache invalidation mechanism** — acceptable only because posts
+  are currently immutable. The moment editing or deletion exists, TTL
+  alone is insufficient and this needs a real invalidation strategy
+  (see ADR-1's revisit conditions).
 
 ---
 
-## Post-merge fix: stale connection could evict a live one
+## Next milestone — Milestone 6: Cursor-based timeline pagination
 
-**Discovered during:** the two-worker consumer-group experiment
-(see "Next milestone" section above), while testing multi-tab behavior
-for the same user account.
+**Problem:** `GET /timeline?offset=50` drifts under concurrent writes —
+new posts arriving while a user pages through shifts every subsequent
+offset, causing skipped or duplicated posts on page 2+.
 
-**The bug:** `ConnectionManager.disconnect(user_id)` looked up and popped
-whatever WebSocket was *currently* stored for `user_id`, regardless of
-which physical connection had actually closed. Since `connect()`
-overwrites `self._connections[user_id]` on a second connection (e.g. a
-second browser tab logging into the same account) without closing the
-first, the first connection becomes orphaned but stays open — still
-blocked on `await ws.receive_text()` — until its tab is closed.
+**Solution:** Accept a `cursor` (the score of the last-seen post)
+instead of an `offset`. `ZREVRANGEBYSCORE` returns posts with scores
+below the cursor regardless of new inserts above it.
 
-When that orphaned tab was eventually closed, its `WebSocketDisconnect`
-handler called `disconnect(user_id)`, which popped whatever was
-*currently* in the dict — by then, the second (live, actively used)
-connection — and unsubscribed `ws:notify:{user_id}` on Redis entirely.
-The live tab's WebSocket stayed open and looked completely healthy, but
-silently stopped receiving any notifications, with no error on either
-side. Confirmed via targeted logging of connection identity
-(`id(ws)`) across `connect()`/`disconnect()`/`_listen()`.
-
-**The fix:** `disconnect()` now takes the specific `WebSocket` instance
-being closed, and only acts if it's still the one on record:
-
-    if self._connections.get(user_id) is not ws:
-        return  # stale connection closing — active one untouched
-
-This does not add multi-device support — it only ensures a stale
-connection closing can never affect an unrelated live one. "Last
-connection wins" is still the model: opening a second tab still silently
-takes over routing from the first, and the first tab receives nothing
-from that point on while it remains open. See known limitation below.
-
-## Known limitation (carried forward): single connection per user
-
-`ConnectionManager._connections` is `Dict[str, WebSocket]` — one socket
-per `user_id`. Multiple simultaneous connections for the same account
-(multiple tabs, multiple devices) are not supported: the most recent
-connection silently becomes the only one that receives notifications.
-This matches how a lot of prototypes start, but real multi-device
-support (the pattern Slack/WhatsApp Web use) requires `Dict[str,
-Set[WebSocket]]`, forwarding to every live connection, and
-reference-counted Pub/Sub subscribe/unsubscribe (only unsubscribe from
-`ws:notify:{user_id}` once the set is empty, not on every individual
-disconnect). Deferred — not in scope for the current milestone set.
-
----
-
-## Next milestone — Milestone 5: Post cache
-
-**Problem:** Every timeline read fetches post bodies from PostgreSQL with
-`WHERE id = ANY(...)`. At current traffic this is fast, but the same
-popular post gets re-fetched from Postgres on every timeline it appears
-in — redundant reads that scale with view count, not post count.
-
-**Solution:** Serialize the full post object into a Redis hash
-(`post:{post_id}`) on creation. Timeline reads check Redis first, falling
-back to PostgreSQL only on a cache miss.
-
-**What it unlocks:** PostgreSQL read traffic for timeline fetches drops
-sharply, leaving it to handle writes, follow/unfollow, and occasional
-cache misses — the standard read-through cache pattern.
-
-**Planned experiment before M5:** run a second `worker.py` instance
-alongside the first and observe how Redis Streams' consumer group splits
-message delivery between them — direct, hands-on confirmation of the
-horizontal scaling this milestone's separation was built to unlock.
+**What it unlocks:** Stable feed reads under concurrent write load —
+a prerequisite for real infinite-scroll UX.

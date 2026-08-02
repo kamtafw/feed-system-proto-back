@@ -15,14 +15,16 @@ Why sorted sets instead of a list?
     - Pagination via offset is built-in (no full scan)
 """
 
+import json
 import redis.asyncio as aioredis
 from typing import List, Optional
-from app.config import TIMELINE_MAX
+from app.config import TIMELINE_MAX, POST_CACHE_TTL_SECONDS
 
 _client: Optional[aioredis.Redis] = None
 
 
 # Lifecycle
+
 
 async def init_cache(url: str) -> None:
     global _client
@@ -37,6 +39,7 @@ async def close_cache() -> None:
 
 
 # Timeline operations
+
 
 async def push_to_timeline(user_id: str, post_id: str, score: float) -> None:
     """
@@ -72,3 +75,41 @@ async def get_timeline_ids(
 async def remove_from_timeline(user_id: str, post_id: str) -> None:
     """For delete/moderation flows added later."""
     await _client.zrem(f"timeline:{user_id}", post_id)
+
+
+# Post cache (Milestone 5)
+#
+# Posts are cached as JSON strings (post:{id}), not Redis hashes — see the
+# ADR in architecture-review.md. Short version: timeline reads are bulk
+# fetches by post ID list, which MGET serves in one round trip; posts
+# are immutable right now, so there's no field to update atomically.
+# Revisit if posts become editable/deletable, or gain independently
+# mutating fields (reaction counts, view counts, etc).
+
+
+def _post_key(post_id: str) -> str:
+    return f"post:{post_id}"
+
+
+async def get_posts(post_ids: List[str]) -> dict:
+    """Bulk cache lookup. Returns {post_id: post_dict} for HITS only —
+    callers detect misses via `set(post_ids) - result.keys()`"""
+    if not post_ids:
+        return {}
+    raw_values = await _client.mget([_post_key(pid) for pid in post_ids])
+    return {pid: json.loads(raw) for pid, raw in zip(post_ids, raw_values) if raw is not None}
+
+
+async def set_post(post: dict, ttl: int = POST_CACHE_TTL_SECONDS) -> None:
+    """Cache a single post. Called on write to warm the cache before fanout runs."""
+    await _client.set(_post_key(post["id"]), json.dumps(post), ex=ttl)
+
+
+async def set_posts(posts: List[dict], ttl: int = POST_CACHE_TTL_SECONDS) -> None:
+    """Bulk backfill after a read-path miss. Pipelined — one round trip."""
+    if not posts:
+        return
+    async with _client.pipeline(transaction=False) as pipe:
+        for post in posts:
+            pipe.set(_post_key(post["id"]), json.dumps(post), ex=ttl)
+        await pipe.execute()
