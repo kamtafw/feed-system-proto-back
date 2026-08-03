@@ -13,6 +13,11 @@ Why sorted sets instead of a list?
     - zrevrange gives newest-first without sorting on read
     - zremrangebyrank caps memory at TIMELINE_MAX entries automatically
     - Pagination via offset is built-in (no full scan)
+
+Milestone 6: pagination moved from offset-based (ZREVRANGE with a
+positional start/stop) to cursor-based (ZREVRANGEBYSCORE with a value
+boundary). See get_timeline_ids() docstring and
+docs/milestone-6-cursor-pagination.md for why.
 """
 
 import json
@@ -57,19 +62,24 @@ async def push_to_timeline(user_id: str, post_id: str, score: float) -> None:
         await pipe.execute()
 
 
-async def get_timeline_ids(
-    user_id: str,
-    limit: int = 50,
-    offset: int = 0,
-) -> List[str]:
+async def get_timeline_ids(user_id: str, cursor: Optional[float] = None, limit: int = 50) -> List[str]:
     """
-    Return post IDs, newest first.
-    offset + limit enables simple cursor-based pagination:
-        page 1 → offset=0,  limit=50
-        page 2 → offset=50, limit=50
+    Return post IDs, newest first, using CURSOR-based pagination (Milestone 6).
+
+    cursor = created_at of the last post the CLIENT has already seen —
+    a value, not a position. We query with an EXCLUSIVE upper bound
+    ("(cursor" in Redis's range syntax) so that post is never re-returned.
+
+    This is the entire fix for offset drift: a new post inserted above the
+    cursor changes nothing about "everything scored below X" — unlike an
+    offset, which is a position that shifts every time something is
+    inserted ahead of it.
+
+    cursor=None → first page, starts from "+inf" (now).
     """
     key = f"timeline:{user_id}"
-    return await _client.zrevrange(key, offset, offset + limit - 1)
+    max_score = f"({cursor}" if cursor is not None else "+inf"
+    return await _client.zrevrangebyscore(key, max_score, "-inf", start=0, num=limit)
 
 
 async def remove_from_timeline(user_id: str, post_id: str) -> None:
