@@ -5,6 +5,10 @@ Milestone 3 change: manager.init(REDIS_URL) and manager.close() added to
 the lifespan. ConnectionManager now needs Redis to set up the Pub/Sub
 listener before any WebSocket connection arrive.
 
+Milestone 6 change: GET /timeline/{user_id} now takes an opaque `cursor`
+string instead of a positional `offset`. See get_timeline() docstring and
+docs/milestone-6-cursor-pagination.md.
+
 Initialisation order matters:
     1. db       —   PostgreSQL pool (consumers depend on it)
     2. cache    —   Redis timeline ops (consumers depend on it)
@@ -21,6 +25,7 @@ processed while the connections below it are closing.
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -305,18 +310,36 @@ async def create_post(
 
 
 @app.get("/timeline/{user_id}")
-async def get_timeline(user_id: str, limit: int = 50, offset: int = 0):
+async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 10):
     """
-    Milestone 5: cache-aside read.
-        1. Redis sorted set → post IDs, newest-first (unchanged)
-        2. MGET the post cache for those IDs
-        3. Postgres ANY($1::text[]) ONLY for misses, then backfill
+    Milestone 6: cursor-based pagination.
 
-    Full cache miss degrades gracefully to exactly the pre-M5 behavior.
+    cursor = created_at of the last post the CLIENT already has, treated
+    as an OPAQUE string by this contract — today it's a stringified float,
+    but neither this endpoint's callers nor the frontend should assume
+    that encoding. See docs/milestone-6-cursor-pagination.md (ADR-2).
+
+    Omitted cursor = first page (newest posts).
+    next_cursor: null in the response = no older posts left.
+
+    Milestone 5's cache-aside logic (MGET → Postgres fallback → backfill)
+    is unchanged below — pagination and caching are orthogonal seams.
     """
-    post_ids = await cache.get_timeline_ids(user_id, limit=limit, offset=offset)
+    cursor_value: Optional[float] = None
+    if cursor is not None:
+        try:
+            cursor_value = float(cursor)
+        except ValueError:
+            raise HTTPException(400, "Invalid cursor")
+
+    # Fetch one extra so we can tell "is there a next page" without a
+    # second round-trip that might come back empty.
+    fetched = await cache.get_timeline_ids(user_id, cursor=cursor_value, limit=limit + 1)
+    has_more = len(fetched) > limit
+    post_ids = fetched[:limit]
+
     if not post_ids:
-        return []
+        return {"posts": [], "next_cursor": None}
 
     cached = await cache.get_posts(post_ids)
     missing_ids = [pid for pid in post_ids if pid not in cached]
@@ -331,7 +354,10 @@ async def get_timeline(user_id: str, limit: int = 50, offset: int = 0):
             print(f"[Cache] Failed to backfill {len(db_posts)} post(s): {e!r}")
         cached.update({post["id"]: post for post in db_posts})
 
-    return [cached[pid] for pid in post_ids if pid in cached]
+    posts = [cached[pid] for pid in post_ids if pid in cached]
+    next_cursor = str(posts[-1]["created_at"]) if (has_more and posts) else None
+
+    return {"posts": posts, "next_cursor": next_cursor}
 
 
 # WebSockets
