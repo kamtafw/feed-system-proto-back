@@ -1,105 +1,116 @@
-# Milestone 5 — Post Cache
+# Milestone 6 — Cursor-Based Timeline Pagination
 
-## FanoutFeed · `milestone-5-post-cache`
+## FanoutFeed · `milestone-6-cursor-pagination`
 
 ---
 
 ## Goal
 
-Reduce Postgres read load on `GET /timeline/{user_id}` by caching post
-bodies in Redis, converting the timeline read into a cache-aside pattern.
+Replace offset-based timeline pagination with cursor-based pagination,
+eliminating drift (skipped/duplicated posts) when new posts arrive while
+a user is scrolling through older pages. Ship the full vertical slice:
+backend, frontend infinite scroll, tests.
 
 ---
 
 ## Previous architecture and its limitation
 
-Since the prototype, timeline reads were a two-step operation:
+`GET /timeline?offset=50&limit=50` used `ZREVRANGE(key, offset, offset+limit-1)`
+— a *positional* window into the sorted set. If 3 new posts land while a
+user is reading page 1, every post's position shifts by 3. Page 2's
+`offset=50` now points 3 slots further in than the user's mental model:
+3 posts get skipped, or 3 get duplicated, depending on scroll direction.
 
-1. `cache.get_timeline_ids()` — Redis `ZREVRANGE`, post IDs newest-first
-2. `db.get_posts_by_ids()` — Postgres `WHERE id = ANY($1::text[])`
-
-Step 2 is a single indexed batch query — cheap in isolation. The problem
-is frequency, not per-query cost: a popular post gets independently
-re-fetched from Postgres once per follower per timeline read. Read
-volume scales with `views × avg followers per post`, not with distinct
-post count.
-
-This is not a felt bottleneck at current traffic — it's introduced
-proactively, per the original roadmap, before it becomes one.
+This is not specific to Redis or this project — it's the standard failure
+mode of offset pagination under any concurrent-write workload.
 
 ---
 
 ## Architecture Decision Records
 
-### ADR-1: Post cache representation — JSON strings, not Redis hashes
+### ADR-1: Cursor is a score-only value; score-tie collisions are an accepted risk
 
 Decision:  
-Store cached posts as JSON strings (post:{id}) instead of Redis hashes.
+Timeline pagination cursor is the created_at score alone —
+not a compound (score, post_id) cursor.
 
 Status:  
-Accepted (Milestone 5)
+Accepted (Milestone 6)
 
 Reason:  
-Timeline reads are bulk fetches by post ID list. MGET provides
-efficient single-round-trip batch retrieval for plain string keys;
-there is no equivalent multi-key-multi-hash primitive. Posts are
-immutable (no edit/delete endpoints exist) — there is no field that
-needs atomic, partial updating, which is the scenario hashes exist
-to serve.
+A score collision requires two posts to share the same created_at
+float, which in practice needs near-simultaneous writes across
+concurrent processes. At current traffic this is rare enough that
+the failure mode — one post skipped or duplicated at a single page
+boundary — costs less than the complexity a compound cursor adds
+(a Lua script, or an extra round-trip plus client-side tie-break
+filtering).
 
 Tradeoffs:
 
 ```text
-+ Simpler implementation
-+ Efficient batch reads (single MGET vs. N pipelined HGETALLs)
-+ Fewer Redis commands
-- Entire JSON must be rewritten if any field changes
-- Less efficient for partial-field updates
++ Cursor is a single float — no encoding, no extra Redis round-trips
+- A tie at the exact page boundary can skip or duplicate one post
+- Collision probability rises with write throughput
 ```
 
 Revisit When:
 
-- Post editing is introduced
-- Delete/restore is introduced
-- Like/view/comment counters are updated frequently
-- Partial-field mutations become common
+- Post creation throughput makes same-timestamp collisions
+observable in practice
+- Exact-once pagination becomes a hard requirement
 
-### ADR-2: Cache writes are best-effort, not part of the durable write path
+### ADR-2: `next_cursor` is an opaque string, not a typed number
 
 Decision:  
-`cache.set_post()` failures on the `POST /posts` write path are logged
-and do not fail the request.
+next_cursor is typed and treated as an opaque string token by both
+the API contract and the frontend, even though the current
+implementation is just a stringified created_at float.
 
 Status:  
-Accepted (Milestone 5)
+Accepted (Milestone 6)
 
 Reason:  
-Redis is a performance layer here, not the source of truth —
-PostgreSQL already durably persisted the post before the cache
-write is attempted. The read-miss path (Postgres fallback +
-backfill) fully repopulates the cache on the next read regardless
-of whether the write-path warm succeeded. Failing the user-facing
-request for a cache-layer problem would trade availability for a
-guarantee we don't actually need.
+Cursor-based APIs (Stripe, GitHub, Relay/GraphQL) universally treat
+cursors as tokens the client passes back verbatim, never parses or
+constructs. Committing to that now costs nothing — the string just
+happens to be a float today — but means a future migration to a
+compound (score, post_id) cursor changes only the encoding inside
+get_timeline()/get_timeline_ids(), with zero frontend changes.
 
 Tradeoffs:
 
 ```text
-+ POST /posts availability is decoupled from Redis health
-+ Consistent with "Redis silently drops on no subscriber" precedent
-already established for Pub/Sub delivery (M3)
-- First few timeline reads after a warm failure hit Postgres before
-the cache self-heals via the miss path
-- Failures are only visible via logs, not surfaced to the caller
++ Future cursor-format migration requires no frontend changes
++ Matches established convention for cursor pagination
+- Marginally less debuggable in dev tools than a raw number —
+negligible today since the string IS just the float
 ```
 
 Revisit When:
 
-- Redis takes on a correctness-critical responsibility that cannot
-be reconstructed from Postgres (e.g., a write-through store, or
-coordination state) — at that point "best-effort" is the wrong
-default and this decision should be revisited per-responsibility,
-not blanket-reversed.
+Not revisited on its own — this is the default going forward.
+Only the internal encoding changes if ADR-1's revisit conditions
+(score collisions becoming observable) are triggered.
+
+---
+
+## API contract change
+
+```text
+Before: GET /timeline/{user_id}?limit=50&offset=0 → Post[]
+After: GET /timeline/{user_id}?limit=50&cursor=<opaque string>
+→ { posts: Post[], next_cursor: string | null }
+```
+
+This intentionally replaces the old offset-based API; no backward
+compatibility is maintained because the frontend is updated in the same
+milestone.
+
+`cursor` omitted = first page. `next_cursor: null` = no older posts left
+— either genuinely exhausted, or the `TIMELINE_MAX` (500) cap has been
+hit and Redis has trimmed anything older (a pre-existing limitation,
+not introduced by this milestone).
 
 ---
 
@@ -109,96 +120,106 @@ not blanket-reversed.
 
 ```text
 backend/
-app/cache.py — get_posts() (bulk MGET), set_post(), set_posts()
-(pipelined bulk write for backfill)
-app/config.py — POST_CACHE_TTL_SECONDS (default 86400s / 24h)
-app/app.py — create_post(): warm cache after DB write, before bus.publish(); best-effort, logged on failure
-get_timeline(): cache-aside read (MGET → Postgres fallback for misses → pipelined backfill → merge, preserving sorted-set order)
+app/cache.py — get_timeline_ids() rewritten: offset → cursor
+               (ZREVRANGE → ZREVRANGEBYSCORE, exclusive upper bound)
+app/app.py   — get_timeline(): opaque cursor parsing, "fetch limit+1"
+               has_more detection, { posts, next_cursor } response shape
+
+frontend/
+src/types.ts — add TimelinePage
+src/api.ts   — getTimeline() returns TimelinePage, takes optional cursor
+src/App.tsx  — pagination state (nextCursor, hasMore, loadingMore),
+               loadMore(), sentinel + end-of-feed markup
+src/App.css  — .scroll-sentinel, .feed-end
 ```
 
 ### New files
 
 ```text
-inspect_post_cache.py — direct Redis inspection: view a cached post + TTL, list all cached keys, or evict a key to force a miss on demand (same pattern as inspect_stream.py from Milestone 2)
+backend/
+test_cursor_pagination.py — seeds a timeline, pages through it while
+                             injecting new posts between fetches, asserts
+                             exactly-once/in-order/no-leak across the
+                             whole session
+
+frontend/
+src/hooks/use-infinite-scroll.ts — IntersectionObserver hook; fires a
+                                    callback when a sentinel element
+                                    scrolls into view
 ```
 
 ### Unchanged
 
-`worker.py`, `consumers.py`, `event_bus.py`, `db.py`, `ws_manager.py`, all frontend files — this milestone only touches the read/write seam in `app.py`, plus two new cache functions. No event contract changes, no consumer logic changes.
+`worker.py`, `consumers.py`, `event_bus.py`, `db.py`, `ws_manager.py`,
+Milestone 5's cache-aside read logic (MGET → Postgres fallback →
+backfill), all auth/follow routes, both WebSocket routes, the composer
+and optimistic-prepend logic in `App.tsx`.
 
 ---
 
 ## Request flow comparison
 
-### Before (pre-M5)
+### Before (offset)
 
 ```
-POST /posts → db.create_post() → bus.publish()
-
-GET /timeline/{id}
-├─ cache.get_timeline_ids() (Redis ZREVRANGE)
-└─ db.get_posts_by_ids() (Postgres, ALWAYS, every read)
+GET /timeline?offset=50&limit=50
+→ ZREVRANGE(key, 50, 99) — a POSITION, shifts under concurrent writes
 ```
 
-### After (M5)
+### After (cursor)
 
 ```
-POST /posts
-├─ db.create_post()
-├─ cache.set_post() ← NEW, best-effort, before publish()
-└─ bus.publish()
-
-GET /timeline/{id}
-├─ cache.get_timeline_ids() (Redis ZREVRANGE, unchanged)
-├─ cache.get_posts() ← NEW, bulk MGET
-├─ db.get_posts_by_ids() ← ONLY for cache misses
-└─ cache.set_posts() ← NEW, backfill misses for next read
+GET /timeline?cursor=<created_at>&limit=50
+→ ZREVRANGEBYSCORE(key, "(<cursor>", "-inf", start=0, num=51)
+— a VALUE boundary; inserts above it don't move anything below it
+→ has_more = fetched 51 items back
+→ next_cursor = created_at of the 50th item (as an opaque string)
 ```
-
-A full cache miss (cold Redis, TTL expiry across the board) degrades to exactly the pre-M5 code path — no new failure mode introduced, just a fast path added on top.
 
 ---
 
 ## Verification
 
-- **Warm read:** `50 hit(s), 0 miss(es)` logged — zero Postgres queries
-  for post bodies on a fully-warm timeline.
-- **Write-path warm:** `💾 [Cache] warmed post:{id}` logged synchronously
-  inside `create_post()`, before the HTTP response. Confirmed via
-  `inspect_post_cache.py <id>` — correct JSON shape, TTL ≈ 86400s.
-- **Organic miss:** creating a new post shifted the top-50 timeline
-  window to include a pre-existing post that had never been read since
-  M5 shipped (and thus was never cached) → `1 miss(es)` logged →
-  Postgres fallback fired → backfilled silently. Confirmed present via
-  `inspect_post_cache.py` afterward.
-- **Manual miss:** `inspect_post_cache.py --evict <id>` → confirmed
-  deleted → subsequent `GET /timeline` (via the frontend) → key
-  reappears with a fresh ≈86400s TTL — confirms the backfill path
-  independent of the organic case above.
+- **`test_cursor_pagination.py`**: 12 seeded posts, paged through while a
+  new post is injected between every single page fetch. Asserts: all 12
+  original posts returned exactly once, in newest-first order; none of
+  the injected posts leaked into the in-progress scroll session; all
+  injected posts correctly appear on a subsequent fresh (cursor=None)
+  fetch. This is the concrete proof offset pagination could not offer —
+  a page boundary that concurrent writes cannot disturb.
+- **Manual browser check**: scrolled through 2–3 pages via infinite
+  scroll while a second logged-in tab posted; already-loaded posts and
+  scroll position were undisturbed, confirming the same guarantee
+  end-to-end through the UI.
 
 ---
 
 ## Known limitations
 
-- **Cache-write failures are silent to the caller by design (ADR-2)** —
-  observable only via logs. Acceptable given Redis's role as a
-  performance layer, not source of truth; revisit if that role changes.
-- **No cache invalidation mechanism** — acceptable only because posts
-  are currently immutable. The moment editing or deletion exists, TTL
-  alone is insufficient and this needs a real invalidation strategy
-  (see ADR-1's revisit conditions).
+- **Score-tie collisions accepted (ADR-1)** — extremely rare at current
+  write rates; one post could theoretically be skipped/duplicated at a
+  page boundary if two posts share an identical `created_at` float.
+- **"N new posts" banner resets pagination to page 1** — pre-existing
+  behavior, not introduced or fixed here. If you've scrolled several
+  pages deep and click the banner, those loaded older pages are
+  discarded in favor of a fresh top-of-feed view.
+- **`TIMELINE_MAX` (500) cap still applies** — cursor pagination can only
+  page as far back as Redis has retained; beyond that, `next_cursor`
+  simply becomes `null` even though older posts still exist in Postgres.
 
 ---
 
-## Next milestone — Milestone 6: Cursor-based timeline pagination
+## Next milestone — Milestone 7: Hybrid fanout (Fanout-on-Write + Fanout-on-Read)
 
-**Problem:** `GET /timeline?offset=50` drifts under concurrent writes —
-new posts arriving while a user pages through shifts every subsequent
-offset, causing skipped or duplicated posts on page 2+.
+**Problem:** Fanout-on-Write doesn't scale to high-follower accounts — a
+single post from a 100k-follower account triggers 100k Redis writes,
+blocking the consumer and creating latency spikes for every other event
+on the bus (the "celebrity problem").
 
-**Solution:** Accept a `cursor` (the score of the last-seen post)
-instead of an `offset`. `ZREVRANGEBYSCORE` returns posts with scores
-below the cursor regardless of new inserts above it.
+**Solution:** Introduce a follower-count threshold. Accounts above it
+skip write-time fanout; their posts are merged into follower timelines
+at read time instead. Accounts below the threshold keep today's
+Fanout-on-Write path unchanged.
 
-**What it unlocks:** Stable feed reads under concurrent write load —
-a prerequisite for real infinite-scroll UX.
+**What it unlocks:** The system can support accounts with millions of
+followers without a structural rewrite of the write path.
