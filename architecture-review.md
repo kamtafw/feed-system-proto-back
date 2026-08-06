@@ -1,116 +1,163 @@
-# Milestone 6 — Cursor-Based Timeline Pagination
+# Milestone 7 — Hybrid Fanout (Fanout-on-Write + Fanout-on-Read)
 
-## FanoutFeed · `milestone-6-cursor-pagination`
+## FanoutFeed · `milestone-7-hybrid-fanout`
 
 ---
 
 ## Goal
 
-Replace offset-based timeline pagination with cursor-based pagination,
-eliminating drift (skipped/duplicated posts) when new posts arrive while
-a user is scrolling through older pages. Ship the full vertical slice:
-backend, frontend infinite scroll, tests.
+Fix the "celebrity problem": a single post from a high-follower account
+currently triggers O(followers) sequential Redis writes in
+`fanout_consumer`, blocking that worker and creating latency spikes for
+every other event on the bus. Introduce a follower-count threshold above
+which accounts skip write-time fanout entirely and are instead merged
+into follower timelines at read time.
+
+Unlike prior milestones, this one changes how the write path *branches*
+rather than adding a new component.
 
 ---
 
 ## Previous architecture and its limitation
 
-`GET /timeline?offset=50&limit=50` used `ZREVRANGE(key, offset, offset+limit-1)`
-— a *positional* window into the sorted set. If 3 new posts land while a
-user is reading page 1, every post's position shifts by 3. Page 2's
-`offset=50` now points 3 slots further in than the user's mental model:
-3 posts get skipped, or 3 get duplicated, depending on scroll direction.
+`fanout_consumer` loops over every follower unconditionally:
 
-This is not specific to Redis or this project — it's the standard failure
-mode of offset pagination under any concurrent-write workload.
+```python
+followers = await db.get_followers(author_id)
+for follower_id in followers:
+  await cache.push_to_timeline(follower_id, post_id, created_at)
+```
+
+At 100k followers, that's 100k sequential awaited Redis round-trips in
+one consumer invocation. `realtime_consumer` has the identical shape for
+the WS push — same root cause, explicitly left unfixed in this
+milestone (see Follow-up).
+
+Roadmap-driven, not felt-pain-driven, same as M5/M6 — our test accounts
+have single-digit followers. `HEAVY_FANOUT_THRESHOLD` is a small,
+env-configurable dev value so the branch is reachable in testing; it is
+not representative of the real ~10,000+ figure from the architecture
+review.
 
 ---
 
 ## Architecture Decision Records
 
-### ADR-1: Cursor is a score-only value; score-tie collisions are an accepted risk
+### ADR-1: Heavy-account detection uses `len(followers)`, not a `COUNT(*)`
 
 Decision:  
-Timeline pagination cursor is the created_at score alone —
-not a compound (score, post_id) cursor.
+fanout_consumer classifies an account as heavy or light using
+len(followers) from the SAME db.get_followers() call it already
+makes — no separate COUNT(*) query, no cached/persisted counter.
 
 Status:  
-Accepted (Milestone 6)
+Accepted (Milestone 7)
 
 Reason:  
-A score collision requires two posts to share the same created_at
-float, which in practice needs near-simultaneous writes across
-concurrent processes. At current traffic this is rare enough that
-the failure mode — one post skipped or duplicated at a single page
-boundary — costs less than the complexity a compound cursor adds
-(a Lua script, or an extra round-trip plus client-side tie-break
-filtering).
+The follower list is already being fetched for the light-path loop;
+reusing it for classification costs nothing extra in the common
+(light) case. A real celebrity account would mean fetching a huge
+list purely to discard it on the heavy branch — an accepted
+inefficiency given we cannot test at real celebrity scale anyway,
+and given the project's standing principle of not solving problems
+before they're felt.
 
 Tradeoffs:
 
 ```text
-+ Cursor is a single float — no encoding, no extra Redis round-trips
-- A tie at the exact page boundary can skip or duplicate one post
-- Collision probability rises with write throughput
++ Zero new queries, zero new state to keep in sync with Postgres
++ Classification can never drift from the real follow graph — it's
+recomputed from source-of-truth data on every single post
+- A genuinely huge follower list is fully materialized in memory
+just to take the heavy branch and discard it
 ```
 
 Revisit When:
+Profiling shows the full-follower-list fetch itself (not the old
+O(followers) Redis writes it replaced) becoming a measurable cost
+for real heavy accounts. At that point, switch to a cheap
+COUNT(*)-first check, only fetching the full list when it turns out
+to be light.
 
-- Post creation throughput makes same-timestamp collisions
-observable in practice
-- Exact-once pagination becomes a hard requirement
-
-### ADR-2: `next_cursor` is an opaque string, not a typed number
+### ADR-2: No "is this followed account currently heavy" index
 
 Decision:  
-next_cursor is typed and treated as an opaque string token by both
-the API contract and the frontend, even though the current
-implementation is just a stringified created_at float.
+GET /timeline/{user_id} always queries authored:{id} for EVERY
+account the user follows, rather than maintaining a separate set of
+currently-classified-heavy account IDs to pre-filter against.
 
 Status:  
-Accepted (Milestone 6)
+Accepted (Milestone 7)
 
 Reason:  
-Cursor-based APIs (Stripe, GitHub, Relay/GraphQL) universally treat
-cursors as tokens the client passes back verbatim, never parses or
-constructs. Committing to that now costs nothing — the string just
-happens to be a float today — but means a future migration to a
-compound (score, post_id) cursor changes only the encoding inside
-get_timeline()/get_timeline_ids(), with zero frontend changes.
+Following-list sizes are typically small (dozens, not thousands).
+An empty ZREVRANGEBYSCORE against a nonexistent authored: key is
+cheap, and all such queries for one request are pipelined into a
+single Redis round-trip regardless of how many come back empty.
+Maintaining a second classification set would mean keeping it in
+sync with account promotion/demotion — genuine complexity for a
+case the "just query it, empty is cheap" approach already handles.
 
 Tradeoffs:
 
 ```text
-+ Future cursor-format migration requires no frontend changes
-+ Matches established convention for cursor pagination
-- Marginally less debuggable in dev tools than a raw number —
-negligible today since the string IS just the float
++ No second piece of state to keep consistent with anything
++ Read cost genuinely scales with how many accounts YOU follow —
+not with anyone's follower count. That's the actual trade-off
+this milestone makes: celebrity-post writes get cheap, and the
+cost moves to every one of their followers' reads instead.
+- A user following a very large number of accounts (most of them
+never heavy) still pays a pipelined-but-nonzero query per
+followed account on every timeline read
 ```
 
 Revisit When:
-
-Not revisited on its own — this is the default going forward.
-Only the internal encoding changes if ADR-1's revisit conditions
-(score collisions becoming observable) are triggered.
+Following-list sizes grow large enough that the per-request
+fan-out of authored: queries becomes the new bottleneck — at that
+point, a maintained "currently heavy" set becomes worth its
+synchronization cost.
 
 ---
 
-## API contract change
+## Design notes (not formal ADRs, but worth documenting)
 
-```text
-Before: GET /timeline/{user_id}?limit=50&offset=0 → Post[]
-After: GET /timeline/{user_id}?limit=50&cursor=<opaque string>
-→ { posts: Post[], next_cursor: string | null }
-```
+### Cursor correctness across multiple sources
 
-This intentionally replaces the old offset-based API; no backward
-compatibility is maintained because the frontend is updated in the same
-milestone.
+The same cursor value is applied independently to every source before
+merging. This preserves M6's no-drift guarantee for two reasons:
 
-`cursor` omitted = first page. `next_cursor: null` = no older posts left
-— either genuinely exhausted, or the `TIMELINE_MAX` (500) cap has been
-hit and Redis has trimmed anything older (a pre-existing limitation,
-not introduced by this milestone).
+1. New inserts in any source score at/near "now," which is always ≥ any
+   cursor derived from already-seen posts — same protection as the
+   single-source case, applied symmetrically.
+2. Fetching `limit+1` from **each** source (not once globally) is
+   provably sufficient: the true global top-`limit` page can contain at
+   most `limit` items from any single source (there are only `limit`
+   slots total), so `limit+1` per source always gives enough headroom to
+   correctly assemble the true merged page and detect `has_more` —
+   regardless of source count or how winners are distributed among them.
+
+One accepted inefficiency: a source that keeps losing the interleaving
+race across several pages gets re-queried (bounded, pipelined) on each
+of those pages before its items finally surface. Not a correctness
+issue, just a minor redundant-query cost.
+
+### Merge strategy: flatten-and-sort, not a k-way merge
+
+Total candidate pool per request is `(1 + accounts_followed) × (limit+1)`
+— a few thousand items at most. `sorted()` on that is microseconds.
+`heapq.merge()` (true k-way merge) is the standard choice when merging
+many large or lazily-streamed sorted sources; here the pool size scales
+*with* the source count rather than being independent of it, so the
+asymptotic advantage doesn't really materialize. Flatten-and-sort is
+simpler to write and equally correct at this scale.
+
+### IDs merged before bodies are resolved
+
+Merging happens on cheap `(post_id, score)` pairs, trimmed to `limit`,
+**before** M5's cache-aside body resolution runs. This keeps the
+Postgres/cache cost of a timeline read identical to a single-source
+read regardless of how many accounts are merged in — only the ID-merge
+step scales with the number of sources.
 
 ---
 
@@ -120,106 +167,130 @@ not introduced by this milestone).
 
 ```text
 backend/
-app/cache.py — get_timeline_ids() rewritten: offset → cursor
-               (ZREVRANGE → ZREVRANGEBYSCORE, exclusive upper bound)
-app/app.py   — get_timeline(): opaque cursor parsing, "fetch limit+1"
-               has_more detection, { posts, next_cursor } response shape
+app/config.py    — HEAVY_FANOUT_THRESHOLD (default 5, dev-scale only)
+app/cache.py     — push_to_authored(), get_timeline_candidates()
+                   (scored variant of get_timeline_ids), 
+                   get_authored_candidates_bulk() (pipelined)
+app/consumers.py — fanout_consumer() branches light/heavy on
+                   len(followers); realtime_consumer() unchanged
+app/app.py       — get_timeline(): merges timeline:{user} +
+                   authored:{followed} candidates before resolving
+                   bodies via M5's unchanged cache-aside logic
 
 frontend/
-src/types.ts — add TimelinePage
-src/api.ts   — getTimeline() returns TimelinePage, takes optional cursor
-src/App.tsx  — pagination state (nextCursor, hasMore, loadingMore),
-               loadMore(), sentinel + end-of-feed markup
-src/App.css  — .scroll-sentinel, .feed-end
+src/types.ts             — add FANOUT_HEAVY to SystemEvent
+src/components/event-log.tsx — render FANOUT_HEAVY distinctly (👑,
+                                follower count only, never the list)
+src/App.css               — .log-fanout-heavy styling
 ```
 
 ### New files
 
 ```text
 backend/
-test_cursor_pagination.py — seeds a timeline, pages through it while
-                             injecting new posts between fetches, asserts
-                             exactly-once/in-order/no-leak across the
-                             whole session
-
-frontend/
-src/hooks/use-infinite-scroll.ts — IntersectionObserver hook; fires a
-                                    callback when a sentinel element
-                                    scrolls into view
+test_hybrid_fanout.py — light-path direct-fanout assertion,
+                        heavy-path authored:-only assertion, and a
+                        read-time-merge assertion proving a
+                        zero-direct-write follower still sees the post
 ```
 
 ### Unchanged
 
-`worker.py`, `consumers.py`, `event_bus.py`, `db.py`, `ws_manager.py`,
-Milestone 5's cache-aside read logic (MGET → Postgres fallback →
-backfill), all auth/follow routes, both WebSocket routes, the composer
-and optimistic-prepend logic in `App.tsx`.
+`worker.py`, `event_bus.py`, `db.py`, `ws_manager.py`, `realtime_consumer`,
+Milestone 5's cache-aside logic, Milestone 6's `get_timeline_ids()` and
+`test_cursor_pagination.py`, all auth/follow routes, both WebSocket
+routes, the frontend composer/optimistic-prepend/infinite-scroll logic.
 
 ---
 
 ## Request flow comparison
 
-### Before (offset)
+### Before (M6, single source)
 
 ```
-GET /timeline?offset=50&limit=50
-→ ZREVRANGE(key, 50, 99) — a POSITION, shifts under concurrent writes
+POST /posts → fanout_consumer → loop over ALL followers → push_to_timeline() × N
+
+GET /timeline/{id} → get_timeline_candidates(user) only → resolve bodies
 ```
 
-### After (cursor)
+### After (M7, hybrid)
 
 ```
-GET /timeline?cursor=<created_at>&limit=50
-→ ZREVRANGEBYSCORE(key, "(<cursor>", "-inf", start=0, num=51)
-— a VALUE boundary; inserts above it don't move anything below it
-→ has_more = fetched 51 items back
-→ next_cursor = created_at of the 50th item (as an opaque string)
+POST /posts → fanout_consumer
+light (≤ threshold): loop over followers → push_to_timeline() × N (unchanged)
+heavy (> threshold): push_to_authored(author) × 1 (NEW)
+
+GET /timeline/{id}
+→ get_timeline_candidates(user) — own feed
+→ get_authored_candidates_bulk(following) — NEW, pipelined
+→ merge (id, score) pairs, dedupe, trim to limit — NEW
+→ resolve bodies for exactly the returned posts (M5, unchanged)
 ```
 
 ---
 
 ## Verification
 
-- **`test_cursor_pagination.py`**: 12 seeded posts, paged through while a
-  new post is injected between every single page fetch. Asserts: all 12
-  original posts returned exactly once, in newest-first order; none of
-  the injected posts leaked into the in-progress scroll session; all
-  injected posts correctly appear on a subsequent fresh (cursor=None)
-  fetch. This is the concrete proof offset pagination could not offer —
-  a page boundary that concurrent writes cannot disturb.
-- **Manual browser check**: scrolled through 2–3 pages via infinite
-  scroll while a second logged-in tab posted; already-loaded posts and
-  scroll position were undisturbed, confirming the same guarantee
-  end-to-end through the UI.
+- **`test_hybrid_fanout.py`** — all three phases passed:
+  - Light account (5 followers, at threshold): all 5 received the post
+    via direct timeline write; `authored:{author}` confirmed empty.
+  - Heavy account (8 followers, over threshold): zero followers received
+    a direct write; `authored:{author}` contained exactly the one post.
+  - Read-time merge: a heavy account's follower who received *zero*
+    direct writes correctly saw the post via the merge logic — proving
+    the branch is invisible to the follower, not just correctly taken
+    on the write side.
+- **Live end-to-end confirmation** — `HEAVY_FANOUT_THRESHOLD` reduced
+  and an existing account (bob) followed past it mid-session. Every
+  subsequent post from that account correctly and repeatedly took the
+  heavy branch (`worker.py` console: `👑 [Fanout/HEAVY] ... writing
+  authored:bob only`, three separate posts). A follower's
+  `GET /timeline` showed rising cache-hit counts including bob's
+  heavy-path posts, despite that follower's own `timeline:` key never
+  receiving those post IDs directly — confirming the merge through the
+  real HTTP request path, not just the isolated test script.
+- **Discovered during this verification, not introduced by this
+  milestone:** none of `FANOUT_START`, `FANOUT_WRITE`, `FANOUT_HEAVY`,
+  `REALTIME_START`, or `REALTIME_SEND` reach the browser's `EventLog`.
+  Root cause and scope are covered under Known Limitations below.
 
 ---
 
 ## Known limitations
 
-- **Score-tie collisions accepted (ADR-1)** — extremely rare at current
-  write rates; one post could theoretically be skipped/duplicated at a
-  page boundary if two posts share an identical `created_at` float.
-- **"N new posts" banner resets pagination to page 1** — pre-existing
-  behavior, not introduced or fixed here. If you've scrolled several
-  pages deep and click the banner, those loaded older pages are
-  discarded in favor of a fresh top-of-feed view.
-- **`TIMELINE_MAX` (500) cap still applies** — cursor pagination can only
-  page as far back as Redis has retained; beyond that, `next_cursor`
-  simply becomes `null` even though older posts still exist in Postgres.
+- **Heavy-account classification re-fetches the full follower list**
+  every post, purely to take `len()` (ADR-1) — acceptable given we can't
+  test at real scale, revisit if profiling ever shows it mattering.
+- **Read cost scales with how many accounts you follow**, not
+  introduced as a side effect but as the explicit trade-off this
+  milestone makes (ADR-2).
+- **`realtime_consumer` still has the O(followers) shape** — deliberately
+  deferred, see Next Milestone.
+- **Consumer-side debug events never reach the browser `EventLog`**
+  (generalizing the Milestone 3 `SystemBroadcaster` per-process
+  limitation): since Milestone 4 moved `fanout_consumer`/
+  `realtime_consumer` into the standalone `worker.py` process — which
+  never serves `/ws/events` — every `system.broadcast()` call from a
+  consumer reaches zero browser clients. This affects `FANOUT_START`,
+  `FANOUT_WRITE`, `FANOUT_HEAVY` (new in this milestone), `REALTIME_START`,
+  and `REALTIME_SEND` — all silently invisible since M4, not a
+  regression introduced here. `POST_CREATED` is the only event that has
+  ever worked, because it's broadcast from `app.py`'s process, which
+  *does* serve `/ws/events`. Frontend rendering for `FANOUT_HEAVY` is
+  complete and correct; it just has nothing to receive from yet.
+  Console/terminal output in `worker.py` remains the reliable way to
+  observe consumer-side behavior in the meantime. Fix scoped as
+  Milestone 7.5.
 
 ---
 
-## Next milestone — Milestone 7: Hybrid fanout (Fanout-on-Write + Fanout-on-Read)
+## Next milestone
 
-**Problem:** Fanout-on-Write doesn't scale to high-follower accounts — a
-single post from a 100k-follower account triggers 100k Redis writes,
-blocking the consumer and creating latency spikes for every other event
-on the bus (the "celebrity problem").
+- **M7.5** — Fix `SystemBroadcaster`'s cross-process routing: mirror
+  `ConnectionManager`'s existing Redis Pub/Sub pattern (publish from any
+  process, forward to local `/ws/events` clients from whichever process
+  holds them) so consumer-side debug events finally reach the browser.
+- Fix `realtime_consumer`'s identical per-follower WS-push loop (same
+  root cause as this milestone, deferred here to keep scope focused).
+- M8 — Persistent notification store (per the original roadmap).
 
-**Solution:** Introduce a follower-count threshold. Accounts above it
-skip write-time fanout; their posts are merged into follower timelines
-at read time instead. Accounts below the threshold keep today's
-Fanout-on-Write path unchanged.
-
-**What it unlocks:** The system can support accounts with millions of
-followers without a structural rewrite of the write path.
