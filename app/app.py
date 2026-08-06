@@ -310,20 +310,27 @@ async def create_post(
 
 
 @app.get("/timeline/{user_id}")
-async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 10):
+async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 50):
     """
-    Milestone 6: cursor-based pagination.
+    Milestone 7: hybrid-fanout read path.
 
-    cursor = created_at of the last post the CLIENT already has, treated
-    as an OPAQUE string by this contract — today it's a stringified float,
-    but neither this endpoint's callers nor the frontend should assume
-    that encoding. See docs/milestone-6-cursor-pagination.md (ADR-2).
+    Merges TWO kinds of source before resolving any post bodies:
+        1. timeline:{user_id}      —    this user's own precomputed feed
+        2. authored:{followed_id}  —    for EVERY account they follow, in
+                                        case that account has ever gone
+                                        heavy (empty otherwise — ADR-2)
 
-    Omitted cursor = first page (newest posts).
-    next_cursor: null in the response = no older posts left.
+    The SAME cursor is applied independently to every source before
+    merging — this preserves M6's no-drift guarantee across a
+    multi-source read. Fetching limit+1 from EACH source (not once
+    globally) is provably sufficient to compute the correct merged page
+    and has_more, regardless of source count or distribution — see
+    docs/milestone-7-hybrid-fanout.md.
 
-    Milestone 5's cache-aside logic (MGET → Postgres fallback → backfill)
-    is unchanged below — pagination and caching are orthogonal seams.
+    IDs are merged, deduped, and trimmed to `limit` BEFORE resolving
+    bodies — M5's cache-aside logic below runs only against the posts
+    actually being returned, not the discarded overflow from every
+    source.
     """
     cursor_value: Optional[float] = None
     if cursor is not None:
@@ -332,14 +339,26 @@ async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 
         except ValueError:
             raise HTTPException(400, "Invalid cursor")
 
-    # Fetch one extra so we can tell "is there a next page" without a
-    # second round-trip that might come back empty.
-    fetched = await cache.get_timeline_ids(user_id, cursor=cursor_value, limit=limit + 1)
-    has_more = len(fetched) > limit
-    post_ids = fetched[:limit]
+    fetch_n = limit+1
+    following = await db.get_following(user_id)
+
+    own_candidates = await cache.get_timeline_candidates(user_id, cursor=cursor_value, limit=fetch_n)
+    authored_by_followed = await cache.get_authored_candidates_bulk(following, cursor=cursor_value, limit=fetch_n)
+
+    pool: dict[str, float]={}
+    for pid, score in own_candidates:
+        pool[pid] = score
+    for candidates in authored_by_followed.values():
+        for pid, score in candidates:
+            pool.setdefault(pid, score) # defensive dedupe
+
+    ranked = sorted(pool.items(), key=lambda item: item[1], reverse=True)
+    has_more = len(ranked) >limit
+    page = ranked[:limit]
+    post_ids = [pid for pid, _ in page]
 
     if not post_ids:
-        return {"posts": [], "next_cursor": None}
+        return {'posts': [], 'next_cursor': None}
 
     cached = await cache.get_posts(post_ids)
     missing_ids = [pid for pid in post_ids if pid not in cached]

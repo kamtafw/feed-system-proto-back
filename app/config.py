@@ -21,7 +21,7 @@ REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 # The ~ (approximate) flag makes trimming cheaper — Redis trims to the nearest
 # internal node boundary rather than exact count, which avoids rewriting entries.
 # 10 000 events covers a multi-hour outage at typical write rates for 800-1000 users.
-STREAM_MAX_LEN  = int(os.getenv("STREAM_MAX_LEN",  "10000"))
+STREAM_MAX_LEN = int(os.getenv("STREAM_MAX_LEN", "10000"))
 
 # How long (ms) a message can sit unACKed before XAUTOCLAIM retries it.
 # 30 s is generous — fanout for 1000 followers at 1 ms/write takes < 1 s.
@@ -34,3 +34,11 @@ STREAM_RECLAIM_MS = int(os.getenv("STREAM_RECLAIM_MS", "30000"))
 # where timeline reads overwhelmingly reference recent posts; older posts
 # fall through to Postgres on the rare read and get re-cached then.
 POST_CACHE_TTL_SECONDS = int(os.getenv("POST_CACHE_TTL_SECONDS", "86400"))
+
+# Hybrid fanout (Milestone 7)
+# Accounts with more followers than this skip per-follower timeline writes
+# and use the read-time merge path instead. Real celebrity-scale numbers
+# (per architecture review) are 10k+; this default is deliberately tiny so
+# the hybrid branch is reachable with a handful of test accounts. len(followers)
+# is recomputed on every post (see ADR-1) — nothing here is cached or persisted.
+HEAVY_FANOUT_THRESHOLD = int(os.getenv("HEAVY_FANOUT_THRESHOLD", "4"))
