@@ -1,21 +1,18 @@
 """
 app.py — FastAPI application.
 
-Milestone 3 change: manager.init(REDIS_URL) and manager.close() added to
-the lifespan. ConnectionManager now needs Redis to set up the Pub/Sub
-listener before any WebSocket connection arrive.
-
-Milestone 6 change: GET /timeline/{user_id} now takes an opaque `cursor`
-string instead of a positional `offset`. See get_timeline() docstring and
-docs/milestone-6-cursor-pagination.md.
+Milestone 7.5: the lifespan now inits/closes the shared PubSubRouter
+directly, instead of calling manager.init()/manager.close(). Both
+ConnectionManager and SystemBroadcaster are stateless facades over that
+one router.
 
 Initialisation order matters:
     1. db       —   PostgreSQL pool (consumers depend on it)
     2. cache    —   Redis timeline ops (consumers depend on it)
     3. bus      —   Redis Streams event bus
-    4. manager  —   Redis Pub/Sub WebSocket router (must be ready before
-                    the first WebSocket connection, which could arrive the
-                    moment uvicorn starts accepting requests)
+    4. router   —   Redis Pub/Sub cross-process WebSocket delivery (must
+                    be ready before the first WebSocket connection, which
+                    could arrive the moment uvicorn starts accepting requests)
     5. listener —   starts consuming from Redis Streams
 
 Teardown is the reverse: cancel listener first so no new events are
@@ -45,6 +42,7 @@ from app.auth import (
 from app.config import DATABASE_URL, REDIS_URL, REFRESH_TOKEN_EXPIRE_DAYS
 from app.event_bus import bus
 from app.ws_manager import manager, system
+from app.ws_router import router
 
 # Lifespan
 
@@ -61,7 +59,7 @@ async def lifespan(app: FastAPI):
     # bus.init() is still required here: publish() uses the same client.
     await bus.init(REDIS_URL)
 
-    await manager.init(REDIS_URL)
+    await router.init(REDIS_URL)
 
     hashed = hash_password(_SEED_PASSWORD)
     for uid in ("alice", "bob", "carol", "dave"):
@@ -71,7 +69,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    await manager.close()  # stop Pub/Sub listener, disconnect Redis
+    await router.close()
     await bus.close()
     await cache.close_cache()
     await db.close_db()
@@ -385,13 +383,18 @@ async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 
 
 @app.websocket("/ws/events")
 async def system_events_ws(ws: WebSocket):
-    """Public debug event stream. Per-worker — shows events from this process."""
+    """
+    Public debug event stream. Milestone 7.5: now genuinely cross-process
+    — events broadcast from worker.py's fanout_consumer/realtime_consumer
+    reach this connection via the shared PubSubRouter, not just events
+    broadcast from within this same process.
+    """
     await system.connect(ws)
     try:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
-        system.disconnect(ws)
+        await system.disconnect(ws)
 
 
 @app.websocket("/ws/feed")
@@ -402,11 +405,7 @@ async def feed_ws(
     """
     Authenticated personal feed channel.
     Connect: ws://localhost:8000/ws/feed?token=<access_token>
-    Receives: { type: "NEW_POST", post_id, author_id, author_name }
-
-    On connect: this worker subscribes to ws:notify:{user_id} on Redis.
-    On disconnect: this worker unsubscribes.
-    Notifications arrive via Redis Pub/Sub from any worker.
+    Receives: { type: "NEW_POST", post_id, author_id, author_name }    
     """
     user_id = current_user["sub"]
     await manager.connect(user_id, ws)
@@ -414,4 +413,4 @@ async def feed_ws(
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(user_id, ws)
+        await manager.disconnect(user_id, ws)
