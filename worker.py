@@ -20,6 +20,17 @@ realtime_consumer calls manager.send(), which only needs router.publish()
 — a method that works identically whether or not this process has ever
 registered a single local subscriber.
 
+Milestone 8: adds on_post_created and on_follow_created, the Notification
+subsystem's write-side consumers (app/notifications.py). They're
+registered here, alongside fanout_consumer/realtime_consumer, rather than
+folded into consumers.py — timeline fanout and notification creation are
+different business capabilities that happen to react to the same events;
+see app/notifications.py's module docstring for the full reasoning.
+on_post_created has no ordering dependency on fanout_consumer or
+realtime_consumer (unlike fanout->realtime's timeline-before-push
+guarantee from M0.5) — it's registered last here purely for readability,
+not because order matters to it.
+
 Independent of the HTTP process's lifecycle — can be started, stopped, or
 scaled (more instances) without touching the HTTP server at all.
 
@@ -32,6 +43,7 @@ import asyncio
 from app import db, cache
 from app.config import DATABASE_URL, REDIS_URL
 from app.consumers import fanout_consumer, realtime_consumer
+from app.notifications import on_post_created, on_follow_created
 from app.event_bus import bus
 from app.ws_router import router
 
@@ -44,6 +56,8 @@ async def main() -> None:
 
     bus.subscribe("PostCreated", fanout_consumer)
     bus.subscribe("PostCreated", realtime_consumer)
+    bus.subscribe("PostCreated", on_post_created)
+    bus.subscribe("FollowCreated", on_follow_created)
 
     print("✅  Worker ready — consuming PostCreated events")
 

@@ -6,6 +6,21 @@ directly, instead of calling manager.init()/manager.close(). Both
 ConnectionManager and SystemBroadcaster are stateless facades over that
 one router.
 
+Milestone 8: adds the Notification subsystem's HTTP surface and the
+FollowCreated publish that feeds it. This route module never touches
+app/db.py's notification functions or app/cache.py's Redis keys directly
+for anything notifications-related — everything goes through
+app/notifications.py, the subsystem's single entry point.
+
+Note on the FollowCreated publish below: it is NOT wrapped in a
+try/except, deliberately matching create_post()'s existing
+bus/publish() call, which has the same uncaught-failure shape. If Redis
+is unavailable at that instant, the follow row commits but the event
+never publishes, and the request 500s despite the write having
+succeeded — an existing architectural gap (see M2/M8 notes), not
+something M8 introduces or attempts to fix here. A proper fix belongs to
+a future Outbox-pattern reliability milestone, not this one.
+
 Initialisation order matters:
     1. db       —   PostgreSQL pool (consumers depend on it)
     2. cache    —   Redis timeline ops (consumers depend on it)
@@ -30,6 +45,7 @@ from pydantic import BaseModel
 
 from app import db
 from app import cache
+from app import notifications
 from app.auth import (
     create_access_token,
     generate_refresh_token,
@@ -226,6 +242,20 @@ async def follow_user(
     if not await db.get_user(target_id):
         raise HTTPException(404, "User not found")
     await db.add_follow(user_id, target_id)
+
+    # Milestone 8: publish so the Notification subsystem's on_follow_created
+    # consumer can create a NEW_FOLLOWER notification for target_id. See
+    # module docstring re: this call being deliberately unguarded, matching
+    # create_post()'s existing bus.publish() shape.
+    await bus.publish(
+        "FollowCreated",
+        {
+            "follower_id": user_id,
+            "followee_id": target_id,
+            "created_at": time.time(),
+        },
+    )
+
     return {"ok": True}
 
 
@@ -337,26 +367,26 @@ async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 
         except ValueError:
             raise HTTPException(400, "Invalid cursor")
 
-    fetch_n = limit+1
+    fetch_n = limit + 1
     following = await db.get_following(user_id)
 
     own_candidates = await cache.get_timeline_candidates(user_id, cursor=cursor_value, limit=fetch_n)
     authored_by_followed = await cache.get_authored_candidates_bulk(following, cursor=cursor_value, limit=fetch_n)
 
-    pool: dict[str, float]={}
+    pool: dict[str, float] = {}
     for pid, score in own_candidates:
         pool[pid] = score
     for candidates in authored_by_followed.values():
         for pid, score in candidates:
-            pool.setdefault(pid, score) # defensive dedupe
+            pool.setdefault(pid, score)  # defensive dedupe
 
     ranked = sorted(pool.items(), key=lambda item: item[1], reverse=True)
-    has_more = len(ranked) >limit
+    has_more = len(ranked) > limit
     page = ranked[:limit]
     post_ids = [pid for pid, _ in page]
 
     if not post_ids:
-        return {'posts': [], 'next_cursor': None}
+        return {"posts": [], "next_cursor": None}
 
     cached = await cache.get_posts(post_ids)
     missing_ids = [pid for pid in post_ids if pid not in cached]
@@ -375,6 +405,68 @@ async def get_timeline(user_id: str, cursor: Optional[str] = None, limit: int = 
     next_cursor = str(posts[-1]["created_at"]) if (has_more and posts) else None
 
     return {"posts": posts, "next_cursor": next_cursor}
+
+
+# Notifications (Milestone 8)
+#
+# All four routes only ever call into app/notifications.py — never
+# app/db.py directly — keeping the notifications subsystem's read-side
+# entry point single, the same way app/cache.py is the only thing that
+# ever issues Redis commands for timelines.
+
+
+@app.get("/notifications")
+async def get_notifications(
+    cursor: Optional[str] = None,
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    cursor is opaque to the client, encoded as "{created_at}:{id}" —
+    never parsed or constructed on the frontend, same discipline M6
+    established for the timeline cursor. It's a compound key here (see
+    app/notifications.py and architecture-review.md for why this
+    diverges from M6's score-only cursor).
+    """
+    parsed_cursor = None
+    if cursor is not None:
+        try:
+            created_at_str, id_str = cursor.split(":")
+            parsed_cursor = (float(created_at_str), int(id_str))
+        except (ValueError, TypeError):
+            raise HTTPException(400, "Invalid cursor")
+
+    items, next_cursor = await notifications.list_notifications(current_user["sub"], cursor=parsed_cursor, limit=limit)
+    next_cursor_str = f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None
+    return {"notifications": items, "next_cursor": next_cursor_str}
+
+
+@app.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: int, current_user: dict = Depends(get_current_user)):
+    """
+    404 covers both "no such notification" and "exists but belongs to
+    someone else" — identically, on purpose. The id is just an opaque
+    client handle; ownership (recipient_id match) is the actual security
+    boundary, enforced entirely inside notifications.mark_read().
+    """
+    ok = await notifications.mark_read(notification_id, current_user["sub"])
+    if not ok:
+        raise HTTPException(404, "Notification not found")
+    return {"ok": True}
+
+
+app.post("/notifications/read-all")
+
+
+async def mark_all_notifications_read(current_user: dict = Depends(get_current_user)):
+    count = await notifications.mark_all_read(current_user["sub"])
+    return {"marked_read": count}
+
+
+@app.get("/notifications/unread-count")
+async def get_unread_notification_count(current_user: dict = Depends(get_current_user)):
+    count = await notifications.get_unread_count(current_user["sub"])
+    return {"count": count}
 
 
 # WebSockets
@@ -405,7 +497,7 @@ async def feed_ws(
     """
     Authenticated personal feed channel.
     Connect: ws://localhost:8000/ws/feed?token=<access_token>
-    Receives: { type: "NEW_POST", post_id, author_id, author_name }    
+    Receives: { type: "NEW_POST", post_id, author_id, author_name }
     """
     user_id = current_user["sub"]
     await manager.connect(user_id, ws)
