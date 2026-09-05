@@ -244,13 +244,17 @@ async def follow_user(
     await db.add_follow(user_id, target_id)
 
     # Milestone 8: publish so the Notification subsystem's on_follow_created
-    # consumer can create a NEW_FOLLOWER notification for target_id. See
-    # module docstring re: this call being deliberately unguarded, matching
-    # create_post()'s existing bus.publish() shape.
+    # consumer can create a NEW_FOLLOWER notification for target_id.
+    # Milestone 8.5: follower_name is included for notify_new_follower_hint's
+    # live WS hint — sourced straight from the JWT payload (create_access_token
+    # already embeds "name"), no extra DB lookup needed. See module docstring
+    # re: this call being deliberately unguarded, matching create_post()'s
+    # existing bus.publish() shape.
     await bus.publish(
         "FollowCreated",
         {
             "follower_id": user_id,
+            "follower_name": current_user['name'],
             "followee_id": target_id,
             "created_at": time.time(),
         },

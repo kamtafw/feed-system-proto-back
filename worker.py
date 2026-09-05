@@ -31,6 +31,18 @@ realtime_consumer (unlike fanout->realtime's timeline-before-push
 guarantee from M0.5) — it's registered last here purely for readability,
 not because order matters to it.
 
+Milestone 8.5: adds notify_new_post_hint and notify_new_follower_hint,
+the Notification subsystem's live best-effort WS companions. Both are
+registered AFTER their durable counterpart for the same event type —
+on_post_created before notify_new_post_hint, on_follow_created before
+notify_new_follower_hint — a REAL dependency on event_bus.py's current
+sequential handler execution, not incidental ordering. See
+app/notifications.py's module docstring and
+docs/milestone-8.5-realtime-notification-hint.md ADR-2. Both hint
+functions catch and log their own failures and never raise, so a dead
+Redis Pub/Sub connection can never withhold the ACK on already-durable
+work — see ADR-3.
+
 Independent of the HTTP process's lifecycle — can be started, stopped, or
 scaled (more instances) without touching the HTTP server at all.
 
@@ -43,7 +55,12 @@ import asyncio
 from app import db, cache
 from app.config import DATABASE_URL, REDIS_URL
 from app.consumers import fanout_consumer, realtime_consumer
-from app.notifications import on_post_created, on_follow_created
+from app.notifications import (
+    on_post_created,
+    on_follow_created,
+    notify_new_post_hint,
+    notify_new_follower_hint,
+)
 from app.event_bus import bus
 from app.ws_router import router
 
@@ -57,9 +74,11 @@ async def main() -> None:
     bus.subscribe("PostCreated", fanout_consumer)
     bus.subscribe("PostCreated", realtime_consumer)
     bus.subscribe("PostCreated", on_post_created)
+    bus.subscribe("PostCreated", notify_new_post_hint)  # must run after on_post_created
     bus.subscribe("FollowCreated", on_follow_created)
+    bus.subscribe("FollowCreated", notify_new_follower_hint)  # must run after on_follow_created
 
-    print("✅  Worker ready — consuming PostCreated events")
+    print("✅  Worker ready — consuming PostCreated and FollowCreated events")
 
     try:
         await bus.listen()
