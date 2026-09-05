@@ -62,12 +62,42 @@ follower unconditionally, with no light/heavy branch — a known,
 deliberately deferred scalability gap for celebrity-scale accounts (see
 ADR-4 / ADR-5 in the milestone doc for the reasoning and candidate future
 strategies).
+
+-----------------------------------------------------------
+Milestone 8.5 — the live NEW_NOTIFICATION hint
+-----------------------------------------------------------
+notify_new_post_hint and notify_new_follower_hint are a SEPARATE pair of
+consumers from on_post_created / on_follow_created above — not a second
+responsibility bolted onto the durable-write functions. Durable creation
+and live delivery are different failure-tolerance concerns (the durable
+write must succeed or the event must be retried; the live push may
+simply fail and be forgotten), the same way fanout_consumer and
+realtime_consumer are kept separate for the identical reason.
+
+Both are registered in worker.py AFTER their durable counterpart for the
+same event type. This ordering is a REAL dependency on event_bus.py's
+CURRENT sequential, same-process handler execution — see each hint
+function's docstring, and
+docs/milestone-8.5-realtime-notification-hint.md ADR-2, for what would
+need re-establishing if that execution model ever changes.
+
+Both hint functions catch and log every exception internally and NEVER
+re-raise. This is not a style preference — event_bus.py's _process()
+ACKs an event only after every registered handler returns without
+error; if a hint function raised, a dead Redis Pub/Sub connection could
+force a redelivery of already-successful durable work purely to retry a
+non-authoritative push. See ADR-3 in the milestone doc.
+
+The hint payload is deliberately NOT shaped like the REST Notification
+representation (db.get_notifications()'s rows): no id, created_at, or
+read_at. See _notification_hint_payload()'s docstring and ADR-4.
 """
 
 import time
 from typing import List, Optional, Tuple
 
 from app import db
+from app.ws_manager import manager
 
 NEW_POST = "NEW_POST"
 NEW_FOLLOWER = "NEW_FOLLOWER"
@@ -146,6 +176,120 @@ async def on_follow_created(payload: dict) -> None:
         object_id=followee_id,  # self-referential
         created_at=created_at,
     )
+
+
+# Live hint consumers (Milestone 8.5) — best-effort companions to the
+# durable writers above. See module docstring for why these are
+# separate consumers, why their registration order in worker.py matters,
+# and why they must never raise.
+
+
+def _notification_hint_payload(
+    notification_type: str,
+    actor_id: str,
+    actor_name: str,
+    object_type: str,
+    object_id: str,
+) -> dict:
+    """
+    The WS hint payload — the ONLY place its shape is defined, so both
+    hint functions below stay in sync by construction rather than by
+    convention.
+
+    Deliberately NOT shaped like the REST Notification representation:
+    no id, created_at, or read_at. This is what makes "the frontend must
+    never mutate authoritative state from this payload" enforceable
+    rather than just documented — the wire shape simply doesn't carry
+    the fields a REST-shaped update would need. See
+    docs/milestone-8.5-realtime-notification-hint.md ADR-4.
+    """
+    return {
+        "type": "NEW_NOTIFICATION",
+        "notification_type": notification_type,
+        "actor_id": actor_id,
+        "actor_name": actor_name,
+        "object_type": object_type,
+        "object_id": object_id,
+    }
+
+
+async def notify_new_post_hint(payload: dict) -> None:
+    """
+    Best-effort live-push companion to on_post_created. Subscribed to
+    'PostCreated', registered in worker.py AFTER on_post_created.
+
+    That ordering is a real dependency on event_bus.py's CURRENT
+    sequential, same-process handler execution: it relies on
+    on_post_created having already committed durable rows for THIS
+    invocation before any client is told to go check. If event_bus.py's
+    handler execution model ever changes (parallel handlers, separate
+    consumer groups per handler, etc.), this ordering guarantee would
+    need to be re-established explicitly — see milestone 2 doc ADR-2.
+
+    Independently re-fetches followers rather than receiving them from
+    fanout_consumer/on_post_created — the same independent-fetch shape
+    those two consumers and on_post_created already have relative to
+    each other. A known, accepted inefficiency (one more O(followers)
+    Postgres query per post), not addressed here — out of scope per the
+    same discipline that deferred celebrity-scale optimization in M8
+    ADR-5.
+
+    Any failure (Redis Pub/Sub down, a follower's connection gone stale,
+    etc.) is caught and logged, never re-raised. See module docstring
+    for why that's load-bearing, not just defensive style.
+    """
+    try:
+        post_id = payload["post_id"]
+        author_id = payload["author_id"]
+        author_name = payload["author_name"]
+
+        hint = _notification_hint_payload(
+            notification_type=NEW_POST,
+            actor_id=author_id,
+            actor_name=author_name,
+            object_type="post",
+            object_id=post_id,
+        )
+
+        followers = await db.get_followers(author_id)
+        for follower_id in followers:
+            await manager.send(follower_id, hint)
+    except Exception as e:
+        print(f"[Notifications] Live hint failed for PostCreated " f"{payload.get('post_id')!r}: {e!r} — durable notification is unaffected")
+
+
+async def notify_new_follower_hint(payload: dict) -> None:
+    """
+    Best-effort live-push companion to on_follow_created. Subscribed to
+    'FollowCreated', registered in worker.py AFTER on_follow_created —
+    same ordering dependency and never-raise contract as
+    notify_new_post_hint above; see that function's docstring.
+
+    follower_name falls back to follower_id if absent from the payload
+    (e.g. an older or malformed event) rather than raising — a missing
+    display name should degrade the hint's usefulness, never take down
+    delivery of it.
+    """
+    try:
+        follower_id = payload["follower_id"]
+        follower_name = payload.get("follower_name", follower_id)
+        followee_id = payload["followee_id"]
+
+        hint = _notification_hint_payload(
+            notification_type=NEW_FOLLOWER,
+            actor_id=follower_id,
+            actor_name=follower_name,
+            object_type="user",
+            object_id=followee_id,
+        )
+
+        await manager.send(followee_id, hint)
+    except Exception as e:
+        print(
+            f"[Notifications] Live hint failed for FollowCreated "
+            f"({payload.get('follower_id')} -> {payload.get('followee_id')}): "
+            f"{e!r} — durable notification is unaffected"
+        )
 
 
 # Read-side domain functions — the subsystem's only read entry point.

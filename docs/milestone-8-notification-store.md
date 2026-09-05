@@ -103,7 +103,7 @@ general index.
 
 ## Domain functions (`app/notifications.py`)
 
-```
+```python
 on_post_created(payload)     — event consumer: one row per follower
 on_follow_created(payload)   — event consumer: exactly one row
 
@@ -147,7 +147,7 @@ handler, immediately after `db.add_follow()` commits:
 
 ## Consumer topology
 
-```
+```python
 bus.subscribe("PostCreated",   fanout_consumer)
 bus.subscribe("PostCreated",   realtime_consumer)
 bus.subscribe("PostCreated",   on_post_created)      # new
@@ -173,7 +173,7 @@ readability.
 
 ## HTTP API
 
-```
+```text
 GET  /notifications?cursor=&limit=     → { notifications: [...], next_cursor }
 POST /notifications/{id}/read          → mark one as read (recipient-scoped)
 POST /notifications/read-all           → mark all as read
