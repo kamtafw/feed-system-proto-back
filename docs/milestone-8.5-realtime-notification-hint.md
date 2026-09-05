@@ -1,6 +1,6 @@
-# Milestone 8 — Persistent Notification Store
+# Milestone 8.5 — Realtime Notification Hint
 
-## FanoutFeed · `milestone-8-realtime-notification-hint`
+## FanoutFeed · `milestone-8.5-realtime-notification-hint`
 
 ---
 
@@ -257,7 +257,44 @@ app/app.py                — FollowCreated payload now includes follower_name
 front/src/types.ts         — Notification, NotificationPage, NotificationHintWSMessage, FeedWSMessage
 front/src/hooks/use-feed-websocket.ts — branches on NEW_NOTIFICATION alongside NEW_POST
 front/src/App.tsx           — wires the hint callback; minimal hasNewHint affordance
+front/src/App.css            — .notification-hint-btn (see note below)
 ```
+
+**Bell affordance styling was corrected during manual verification, and
+the correction is part of M8.5's scope** (it's a bug in this
+milestone's own new UI element, not a pre-existing one). The bell
+initially reused `.follow-btn`'s styling — built for text labels
+("Following"/"Follow"), never setting an explicit `line-height`. A bare
+emoji glyph (🔔) renders with taller intrinsic ascent/descent metrics
+than Latin text at the same declared font-size, and since `.header` is
+`display: flex; align-items: center` with no fixed height, the untamed
+emoji-only child grew `.header`'s rendered height past the 57px the
+rest of the stylesheet hardcodes (`.layout`, `.splash` both assume
+`calc(100vh - 57px)`) — and only when the bell was actually present,
+i.e. only when `hasNewHint` flipped true, which is why it looked like
+layout breakage tied to "activity." Fixed with a dedicated
+`.notification-hint-btn` class: a fixed 28×28 circle with centered
+content and `line-height: 1`, the same fixed-dimension pattern already
+used by `.header-avatar`/`.compose-avatar`/`.person-avatar` specifically
+to keep glyph metrics from ever affecting layout.
+
+**A second, unrelated layout bug was found and fixed during the same
+manual verification pass, but it is explicitly OUT OF M8.5's scope**:
+`EventLog`'s pre-existing `scrollIntoView()` call (in
+`src/components/event-log.tsx`, untouched by any of this milestone's
+own changes) could escape to page-level scroll, because its ancestors
+(`.event-log`, `.layout`) are `overflow: hidden` and therefore skipped
+by `scrollIntoView`'s ancestor walk, landing on `body`/`html` instead
+and dragging the whole page — feed included — along with it. This bug
+predates M8.5 and has nothing to do with the notification hint
+architecture; it became newly *visible* during this milestone's testing
+because `system.broadcast()`'s events fire on every post, and testing
+the notification hint meant posting repeatedly and watching closely.
+Fixed by scrolling the panel's own `scrollTop` directly instead of
+`scrollIntoView()`-ing a sentinel element, which cannot bubble to any
+ancestor. Recorded here for completeness and because it touched a
+production file during this milestone's work, not because it belongs to
+M8.5's architecture.
 
 ### Unchanged
 
@@ -272,6 +309,14 @@ in M8.
 
 ## Verification
 
+Two layers of verification were performed: automated (both suites
+actually executed against live infrastructure, not just written) and
+manual end-to-end (five scenarios run against the real prototype in a
+browser). Both are recorded here in full, including the adjustments
+made along the way.
+
+### Automated
+
 **`test_notification_hints.py`** (backend, real Postgres + Redis, a
 `FakeWebSocket` registered with the actual `ConnectionManager`/
 `PubSubRouter` — same technique as `test_pubsub_router.py`):
@@ -285,6 +330,22 @@ in M8.
   it falls back to `follower_id` instead of raising.
 - §4 — neither hint payload contains `id`, `created_at`, or `read_at`.
 
+Ran to completion, all four sections passing, against a live backend.
+One test-harness defect was found and fixed along the way, not a defect
+in the implementation under test: the original `FakeWebSocket` only
+implemented `send_text()`, matching `test_pubsub_router.py`'s double —
+but that test calls `router.register()` directly, bypassing
+`ConnectionManager`, while this test deliberately goes through
+`manager.connect()` to exercise the same production path
+`notify_new_post_hint`/`notify_new_follower_hint` actually use via
+`manager.send()`. `ConnectionManager.connect()` calls `await ws.accept()`
+before registering, which the original fake didn't implement. Fixed by
+adding a no-op `accept()` to the fake — confirmed by grepping every
+`ws.<method>(` call across `ws_manager.py` and `ws_router.py`, which
+shows `accept()` and `send_text()` are the *only* two methods ever
+invoked on a WebSocket-like object anywhere in this path. No production
+code changed to make the test pass.
+
 **`test-notification-hint.mjs`** (frontend, plain Node, no build step,
 imports the real module the app uses):
 
@@ -296,12 +357,120 @@ imports the real module the app uses):
   error, not silently accepted.
 - `acknowledgeNotificationHint` clears only the local flag.
 
-Both were actually executed during this milestone, not just written:
-the backend suite compiles cleanly; the frontend suite runs to
-completion; and the full frontend change set was type-checked with
-`tsc` against the project's real compiler settings (`react-jsx`,
-`moduleResolution: bundler`, `verbatimModuleSyntax`, etc.) with zero
-errors.
+Ran to completion, all five assertions passing. The full frontend change
+set was also type-checked with `tsc` against the project's real compiler
+settings (`react-jsx`, `moduleResolution: bundler`,
+`verbatimModuleSyntax`, etc.) with zero errors.
+
+### Manual end-to-end
+
+Five scenarios were run against the real prototype (`main.py` +
+`worker.py` both running, two accounts in separate browser contexts) to
+confirm the automated suites' guarantees hold in the actual running
+system, not just in isolated function calls.
+
+**Test 1 — `NEW_POST` live hint.** A follows B; B posts while A is
+connected. Confirmed in A's DevTools WS Messages: two distinct frames
+arrive — the pre-existing `NEW_POST` message (drives the old
+"N new posts" banner) and a `NEW_NOTIFICATION` frame matching the
+contract exactly (`notification_type: "NEW_POST"`, `actor_id`,
+`actor_name`, `object_type: "post"`, `object_id`, and critically no
+`id`/`created_at`/`read_at`). The bell affordance appeared in A's
+header; `worker.py`'s console stayed silent for the notification path
+specifically (`on_post_created`/`notify_new_post_hint` have no
+success-path log lines, by design — confirmed, not a bug); the
+`/ws/events` EventLog showed only the pre-existing fanout/realtime debug
+events, nothing notification-related, since neither new consumer is
+wired to `system.broadcast()`.
+
+**Test 2 — `NEW_FOLLOWER` live hint.** A follows B while B is connected.
+Confirmed in B's DevTools: exactly one frame (unlike Test 1's pair —
+`FollowCreated` has no legacy WS sibling the way `PostCreated` does),
+`actor_name` correctly sourced from A's JWT payload via `follow_user()`
+(no extra DB lookup), `object_type: "user"` / `object_id` equal to B's
+own id (the self-referential object convention from M8, carried through
+to the hint unchanged). Bell appeared on B's side; EventLog showed
+nothing at all for this event type, before or after — follows have never
+been wired to the debug broadcaster.
+
+**Test 3 — durable state vs. live delivery vs. frontend display are
+independent.** After Test 1's post, `GET /notifications` and
+`GET /notifications/unread-count` were called directly from the browser
+console (bearer token pulled from `localStorage`) at three checkpoints:
+immediately after the bell appeared, immediately after dismissing the
+bell, and after a full page reload. **The response was identical at all
+three checkpoints** — dismissing the bell only ever calls
+`acknowledgeNotificationHint()`, which touches `hasNewHint` and nothing
+else (verified directly in `notification-hint.js`); no route in this
+codebase currently calls `POST /notifications/{id}/read` from the
+frontend at all. The database had no way to know the hint had ever been
+seen or dismissed, because nothing ever told it.
+
+**Test 4 — missed hint / reconnect.** B's tab was closed entirely
+(a real `WebSocketDisconnect`, confirmed via `main.py`'s
+`[WS] {user_id} disconnected` log line — not a reload, which
+`useFeedWebSocket` has no reconnect logic to distinguish from a fresh
+mount anyway). While B was disconnected, A posted. B reconnected
+(fresh `[WS] {user_id} connected` line — a brand-new registration, not
+a resumed one) to **no bell and no banner** — both WS publishes
+(`realtime_consumer`'s and `notify_new_post_hint`'s) went out on
+channels with zero subscribers at that instant and were dropped, exactly
+as `test_pubsub_router.py`'s existing no-subscriber case already proved
+in isolation. B's timeline showed A's post immediately on reload with no
+extra effort (`GET /timeline` already runs unconditionally on mount and
+reads from `timeline:B`, which `fanout_consumer` had written to
+regardless of B's connection state). The same manual `fetch()` calls
+from Test 3, run after reconnecting, showed the missed post's
+notification present, `read_at: null` — the row was never at risk;
+only the live signal was.
+
+The missed-hint behavior this confirms, precisely:
+
+- If the recipient is disconnected, the live hint can be missed.
+- The durable PostgreSQL notification is still present.
+- M8.5 does not attempt to replay missed hints.
+- Recovery through the durable notification REST path belongs to the
+  future notification UI milestone, not this one.
+
+**Test 5 — duplicate/retry behavior.** No practical manual trigger
+exists for this: redelivery requires a handler to raise or the worker
+process to die inside a handler-chain window measured in low single-digit
+milliseconds at this follower count — not something reproducible on
+demand by hand. This property is a timing/concurrency guarantee, not a
+UI-observable behavior, and is already covered precisely by
+`test_notifications.py` §2 (identity-based dedup under simulated
+redelivery), `test_notification_hints.py` §2 (a hint failure cannot
+propagate into `_process()`), and `test_streams.py` (the underlying
+`XACK`/`XPENDING`/`XAUTOCLAIM` mechanics). No manual test was forced
+here — deliberately.
+
+### What manual verification confirmed, as an architectural conclusion
+
+M8.5 verification confirmed that durable notification state, live
+WebSocket delivery, and frontend reaction are independent layers. The
+WebSocket notification hint is intentionally lossy and must never be
+treated as notification state. PostgreSQL remains authoritative; the
+hint merely provides low-latency awareness when the recipient is
+connected.
+
+```text
+Durable notification exists
+        ≠
+WebSocket hint was delivered
+        ≠
+Frontend displayed notification state
+```
+
+These are three independent layers, each with its own failure mode:
+the row can exist with no hint ever sent (recipient offline at publish
+time — Test 4); a hint can be sent and received with the frontend
+still choosing to display nothing lasting from it (`hasNewHint` is
+transient, in-memory, reset on every mount — Test 3); and a hint's
+receipt or dismissal never writes back to the row that caused it. No
+layer here can be inferred from another. This was a design intent going
+in (see "The one rule everything below follows from," above) and is now
+a directly observed, verified property of the running system, not just
+a documented rule.
 
 ---
 
