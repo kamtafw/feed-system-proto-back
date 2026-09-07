@@ -461,7 +461,7 @@ async def mark_notification_read(notification_id: int, current_user: dict = Depe
 
 app.post("/notifications/read-all")
 
-
+@app.post("/notifications/read-all")
 async def mark_all_notifications_read(current_user: dict = Depends(get_current_user)):
     count = await notifications.mark_all_read(current_user["sub"])
     return {"marked_read": count}
