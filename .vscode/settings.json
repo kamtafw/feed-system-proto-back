@@ -4,6 +4,7 @@
 		"followee",
 		"Initialisation",
 		"keepalive",
+		"notif",
 		"xack",
 		"xadd",
 		"xautoclaim",
