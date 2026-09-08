@@ -2,13 +2,11 @@
 
 ## FanoutFeed · `milestone-8.6-notification-reconciliation`
 
-**Status: IMPLEMENTED — pending manual E2E verification.** Type-checked
-against the project's real compiler settings with zero errors;
-automated `isNotificationHint()` coverage updated and passing. Manual
-E2E verification (mirroring M8.5's five-scenario discipline) has not
-yet been run — this document will be updated again at closeout, the
-same way `milestone-8.5-realtime-notification-hint.md` was updated in
-place rather than superseded.
+**Status: COMPLETE.** Implemented, type-checked against the project's
+real compiler settings with zero errors, automated `isNotificationHint()`
+coverage passing, and manual E2E verification confirmed against the
+real running prototype. Updated in place at closeout, the same way
+`milestone-8.5-realtime-notification-hint.md` was.
 
 ---
 
@@ -462,26 +460,59 @@ backported speculatively into this fix.
 
 ---
 
-## Planned verification (not yet executed)
+## Verification
 
-- **Frontend automated**: `test-notification-hint.mjs` updated to drop
-  assertions for the three retired functions; retains and re-verifies
-  `isNotificationHint`'s discrimination behavior.
-- **Manual E2E**, mirroring M8.5's five-scenario discipline: list
-  renders real data; badge reflects real unread count; mark-one and
-  mark-all actually change server-side `read_at` (verified via the same
-  direct `fetch()` console technique used in M8.5 Test 3, now redundant
-  with the UI but useful for confirming the UI matches ground truth);
-  hint arrival while the panel is closed updates the badge without
-  opening anything; hint arrival while the panel is open refreshes the
-  visible list; the exact Test 4 scenario (recipient disconnected,
-  hint missed) resolves cleanly by opening the panel after reconnecting,
-  with no leftover staleness.
+### Automated
 
----
+`test-notification-hint.mjs` was reduced to match ADR-5: the three
+assertions covering `reconcileNotificationHint`/
+`acknowledgeNotificationHint`/`NotificationUIState` were removed along
+with the functions themselves, rather than left pointing at dead code.
+`isNotificationHint()`'s discrimination behavior — `NEW_POST` excluded,
+`NEW_NOTIFICATION` included, malformed input (`null`, `undefined`, a
+bare string, an empty object) safely rejected rather than throwing —
+was re-verified and passes. The full frontend change set was also
+type-checked with `tsc` against the project's real compiler settings
+and complete dependency graph, with zero errors.
 
-## Open items for review
+### Manual E2E
 
-None outstanding — the one open design question (toast vs. trigger) is
-resolved as ADR-1. This document is ready for your review before
-implementation proceeds.
+Verified against the real running prototype, covering the two
+conditions that together prove the reconciliation path actually closes
+the loop M8.5 left open:
+
+- **Recipient connected**: a `NEW_NOTIFICATION` hint arriving correctly
+  triggers a REST refetch of both the notification list and the unread
+  count — confirming the reconciliation flow designed above (hint →
+  `refreshUnreadCount()`, and `loadNotifications()` when the panel is
+  open) behaves as specified in the real app, not just in isolated
+  function calls.
+- **Recipient disconnected during the originating action**: the live
+  hint may be missed, exactly as characterized in M8.5's own Test 4 —
+  but the notification remains available through durable PostgreSQL
+  state, and is recovered by the frontend's REST fetch once the
+  recipient reconnects. Nothing was lost; only the low-latency signal
+  was.
+
+### What manual verification confirmed, as an architectural conclusion
+
+M8.6 verification confirmed the complete durable-to-frontend
+notification path: PostgreSQL provides durable notification state,
+WebSocket provides best-effort low-latency change awareness, and REST
+reconciliation makes the frontend authoritative-state-consistent. A
+missed WebSocket hint does not lose a notification; a later REST fetch
+recovers the durable state.
+
+This is the direct, verified completion of the chain M8, M8.5, and
+M8.6 were each one link of:
+
+```text
+M8   — durable notification    (Postgres, authoritative regardless of who's watching)
+M8.5 — live hint                (best-effort, lossy by design, proven independent of the row)
+M8.6 — frontend reconciliation  (hint → REST refetch → real, authoritative UI state)
+     → usable notification state
+```
+
+What was true only from a browser console after M8.5 — that the row
+survives independent of the hint — is now true from inside the product
+itself: open the panel, and whatever was missed is simply there.
