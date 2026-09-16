@@ -1,37 +1,10 @@
 """
 app.py — FastAPI application.
 
-Milestone 7.5: the lifespan now inits/closes the shared PubSubRouter
-directly, instead of calling manager.init()/manager.close(). Both
-ConnectionManager and SystemBroadcaster are stateless facades over that
-one router.
-
-Milestone 8: adds the Notification subsystem's HTTP surface and the
-FollowCreated publish that feeds it. This route module never touches
-app/db.py's notification functions or app/cache.py's Redis keys directly
-for anything notifications-related — everything goes through
-app/notifications.py, the subsystem's single entry point.
-
-Note on the FollowCreated publish below: it is NOT wrapped in a
-try/except, deliberately matching create_post()'s existing
-bus/publish() call, which has the same uncaught-failure shape. If Redis
-is unavailable at that instant, the follow row commits but the event
-never publishes, and the request 500s despite the write having
-succeeded — an existing architectural gap (see M2/M8 notes), not
-something M8 introduces or attempts to fix here. A proper fix belongs to
-a future Outbox-pattern reliability milestone, not this one.
-
-Initialisation order matters:
-    1. db       —   PostgreSQL pool (consumers depend on it)
-    2. cache    —   Redis timeline ops (consumers depend on it)
-    3. bus      —   Redis Streams event bus
-    4. router   —   Redis Pub/Sub cross-process WebSocket delivery (must
-                    be ready before the first WebSocket connection, which
-                    could arrive the moment uvicorn starts accepting requests)
-    5. listener —   starts consuming from Redis Streams
-
-Teardown is the reverse: cancel listener first so no new events are
-processed while the connections below it are closing.
+Milestone 9: adds rate-limit lifecycle is wiring (init/close alongside the
+other Redis-backend modules) and attaches Depends(rate_limit(action)) to
+the three protected write routes. No other route, response shape, or
+existing behavior changes. See docs/milestone-9-rate-limiting.md.
 """
 
 import time
@@ -57,10 +30,9 @@ from app.auth import (
 )
 from app.config import DATABASE_URL, REDIS_URL, REFRESH_TOKEN_EXPIRE_DAYS
 from app.event_bus import bus
+from app.rate_limit import close_rate_limiter, init_rate_limiter, rate_limit
 from app.ws_manager import manager, system
 from app.ws_router import router
-
-# Lifespan
 
 _SEED_PASSWORD = "password123"
 
@@ -69,13 +41,9 @@ _SEED_PASSWORD = "password123"
 async def lifespan(app: FastAPI):
     await db.init_db(DATABASE_URL)
     await cache.init_cache(REDIS_URL)
-
-    # Event bus — HTTP process only publishes (XADD) now. Consumption
-    # (XREADGROUP / listen()) moved to worker.py as a separate process.
-    # bus.init() is still required here: publish() uses the same client.
     await bus.init(REDIS_URL)
-
     await router.init(REDIS_URL)
+    await init_rate_limiter(REDIS_URL)  # M9 — own client, own lifecycle, same pattern as the above
 
     hashed = hash_password(_SEED_PASSWORD)
     for uid in ("alice", "bob", "carol", "dave"):
@@ -85,6 +53,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await close_rate_limiter()  # M9
     await router.close()
     await bus.close()
     await cache.close_cache()
@@ -98,9 +67,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# Auth helpers
 
 
 def _refresh_expiry() -> float:
@@ -117,9 +83,6 @@ async def _issue_tokens(user_id: str, name: str) -> dict:
         "refresh_token": raw_ref,
         "token_type": "bearer",
     }
-
-
-# Auth routes
 
 
 class RegisterBody(BaseModel):
@@ -210,9 +173,6 @@ async def logout(body: RefreshBody):
     return {"ok": True}
 
 
-# Users (public)
-
-
 @app.get("/users")
 async def list_users():
     return await db.get_all_users()
@@ -221,9 +181,6 @@ async def list_users():
 @app.get("/users/{user_id}/following")
 async def get_following_public(user_id: str):
     return await db.get_following(user_id)
-
-
-# Me — authenticated user's own actions
 
 
 @app.get("/me/following")
@@ -235,6 +192,7 @@ async def get_my_following(current_user: dict = Depends(get_current_user)):
 async def follow_user(
     target_id: str,
     current_user: dict = Depends(get_current_user),
+    _: None = Depends(rate_limit("follow_action")),  # M9 — shared bucket with unfollow
 ):
     user_id = current_user["sub"]
     if user_id == target_id:
@@ -243,18 +201,11 @@ async def follow_user(
         raise HTTPException(404, "User not found")
     await db.add_follow(user_id, target_id)
 
-    # Milestone 8: publish so the Notification subsystem's on_follow_created
-    # consumer can create a NEW_FOLLOWER notification for target_id.
-    # Milestone 8.5: follower_name is included for notify_new_follower_hint's
-    # live WS hint — sourced straight from the JWT payload (create_access_token
-    # already embeds "name"), no extra DB lookup needed. See module docstring
-    # re: this call being deliberately unguarded, matching create_post()'s
-    # existing bus.publish() shape.
     await bus.publish(
         "FollowCreated",
         {
             "follower_id": user_id,
-            "follower_name": current_user['name'],
+            "follower_name": current_user["name"],
             "followee_id": target_id,
             "created_at": time.time(),
         },
@@ -267,12 +218,10 @@ async def follow_user(
 async def unfollow_user(
     target_id: str,
     current_user: dict = Depends(get_current_user),
+    _: None = Depends(rate_limit("follow_action")),  # M9 — shared bucket with follow
 ):
     await db.remove_follow(current_user["sub"], target_id)
     return {"ok": True}
-
-
-# Posts
 
 
 class CreatePostBody(BaseModel):
@@ -282,7 +231,8 @@ class CreatePostBody(BaseModel):
 @app.post("/posts")
 async def create_post(
     body: CreatePostBody,
-    current_user: dict = Depends(get_current_user),  # author_id now from token
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(rate_limit("post_create")),  # M9
 ):
     author_id = current_user["sub"]
     user = await db.get_user(author_id)
@@ -305,10 +255,6 @@ async def create_post(
 
     await db.create_post(post_id, author_id, user["name"], content, created_at)
 
-    # Best-effort cache warm. Redis is a performance layer not the source
-    # of truth (ADR: architecture-review.md) — Postgres write above already
-    # succeeded. A failure here only costs the "warm on write" latency win
-    # for THIS post; GET /timeline's miss-path repopulates it.
     try:
         await cache.set_post(post)
         print(f"💾  [Cache] warmed post:{post_id}")
@@ -336,9 +282,6 @@ async def create_post(
     )
 
     return {"post_id": post_id}
-
-
-# Timeline
 
 
 @app.get("/timeline/{user_id}")
@@ -460,6 +403,7 @@ async def mark_notification_read(notification_id: int, current_user: dict = Depe
 
 
 app.post("/notifications/read-all")
+
 
 @app.post("/notifications/read-all")
 async def mark_all_notifications_read(current_user: dict = Depends(get_current_user)):

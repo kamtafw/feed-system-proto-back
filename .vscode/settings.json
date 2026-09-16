@@ -2,16 +2,19 @@
 	"cSpell.words": [
 		"fanout",
 		"followee",
+		"getenv",
 		"Initialisation",
 		"keepalive",
 		"notif",
+		"undercounting",
 		"xack",
 		"xadd",
 		"xautoclaim",
 		"XGROUP",
 		"xlen",
 		"XPENDING",
-		"xreadgroup"
+		"xreadgroup",
+		"ZSET"
 	],
 	"python-envs.defaultEnvManager": "ms-python.python:venv"
 }

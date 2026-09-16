@@ -60,8 +60,8 @@ seconds old has fully exited the window.
 **Example** (`N=5`, `W=60s`), requests at
 `12:00:01, :05, :10, :20, :30`, then `12:00:45`, `12:01:01`, `12:01:02`:
 
-| TimeCount before this requestAllowed? |                       |   |
-| ------------------------------------- | --------------------- | - |
+| TimeCount before this requestAllowed? |                       |    |
+| ------------------------------------- | --------------------- |  - |
 | 12:00:01                              | 0                     | ✅ |
 | 12:00:05                              | 1                     | ✅ |
 | 12:00:10                              | 2                     | ✅ |
