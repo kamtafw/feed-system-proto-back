@@ -1,12 +1,17 @@
 {
 	"cSpell.words": [
+		"dotenv",
 		"fanout",
+		"fanoutfeed",
 		"followee",
 		"getenv",
 		"Initialisation",
 		"keepalive",
 		"notif",
+		"Supabase",
+		"tonumber",
 		"undercounting",
+		"Uvicorn",
 		"xack",
 		"xadd",
 		"xautoclaim",

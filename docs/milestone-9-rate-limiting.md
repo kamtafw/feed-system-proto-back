@@ -2,13 +2,25 @@
 
 ## FanoutFeed · `milestone-9-rate-limiting`
 
-**Status: DESIGN COMPLETE — implementation not yet started.** This
-document is the design/decision artifact reviewed and approved *before*
-any code is written, per this project's standing discipline (design →
-implementation → automated verification → manual verification →
-closeout). It will be updated in place once implementation and
-verification are complete, the same way `milestone-8.5` and
-`milestone-8.6`'s docs were.
+**Status: IMPLEMENTED AND VERIFIED.** Design was reviewed and approved
+before any code was written, per this project's standing discipline
+(design → implementation → automated verification → manual verification
+→ closeout). This document has been updated in place with the final
+implementation and verification results, the same way `milestone-8.5`
+and `milestone-8.6`'s docs were.
+
+**A note on how verification was performed, stated plainly rather than
+left implicit:** automated and HTTP-level verification below was run
+against a local Postgres + Redis instance provisioned specifically for
+this purpose, running the actual project code — not the project's real
+Supabase/Redis Cloud instances, which aren't reachable from the
+environment implementation was done in. The code, schema, and test
+suite are identical to what runs against the real infrastructure; only
+the specific Postgres/Redis endpoint differs. Re-running
+`test_rate_limit.py` and the manual checks below against the actual dev
+environment before merging is still worthwhile as a final confirmation,
+but is not expected to surface anything new — the rate limiter has no
+dependency on Supabase- or Redis-Cloud-specific behavior.
 
 ---
 
@@ -35,13 +47,29 @@ any prerequisite.
 
 ## Reconnaissance summary (what the actual codebase settled before design began)
 
-- `POST /posts` and `POST /me/follow/{id}` / `DELETE /me/follow/{id}` are the only realistic candidates: they're the writes behind `Depends(get_current_user)`, keyed by the JWT `sub`.
-- `GET /timeline/{user_id}` — the highest-traffic route in the system — is unauthenticated and has no `user_id`-shaped key to rate-limit against. **Deliberately excluded from M9**, not overlooked (see Out of Scope).
-- `worker.py` never touches HTTP and has already committed writes by the time it sees an event — irrelevant to enforcement placement.
-- `create_post` / `add_follow` / `remove_follow` are single auto-committed statements with no transaction boundary to hook into. The rate-limit check has no natural home *inside* the write path — it belongs strictly *before* it.
-- The app already runs (or is designed to run — M3/M7.5) behind multiple Uvicorn workers sharing only Redis and Postgres as common state. This is the actual justification for Redis here (see ADR-1).
-- Existing Redis usage is already split into three independently-owned clients (`cache.py`, `event_bus.py`, `ws_router.py`), each matching a distinct responsibility. No unified key-namespace convention exists across them (`timeline:*`, `ws:*`, `ff:stream:*`).
-- No fake-clock tooling exists anywhere in the test suite; the only precedent for time-dependent testing (`test_streams.py`) waits out a real interval with `asyncio.sleep()`.
+- `POST /posts` and `POST /me/follow/{id}` / `DELETE /me/follow/{id}`
+  are the only realistic candidates: they're the writes behind
+  `Depends(get_current_user)`, keyed by the JWT `sub`.
+- `GET /timeline/{user_id}` — the highest-traffic route in the system —
+  is unauthenticated and has no `user_id`-shaped key to rate-limit
+  against. **Deliberately excluded from M9**, not overlooked (see
+  Out of Scope).
+- `worker.py` never touches HTTP and has already committed writes by
+  the time it sees an event — irrelevant to enforcement placement.
+- `create_post` / `add_follow` / `remove_follow` are single
+  auto-committed statements with no transaction boundary to hook into.
+  The rate-limit check has no natural home *inside* the write path — it
+  belongs strictly *before* it.
+- The app already runs (or is designed to run — M3/M7.5) behind
+  multiple Uvicorn workers sharing only Redis and Postgres as common
+  state. This is the actual justification for Redis here (see ADR-1).
+- Existing Redis usage is already split into three independently-owned
+  clients (`cache.py`, `event_bus.py`, `ws_router.py`), each matching a
+  distinct responsibility. No unified key-namespace convention exists
+  across them (`timeline:*`, `ws:*`, `ff:stream:*`).
+- No fake-clock tooling exists anywhere in the test suite; the only
+  precedent for time-dependent testing (`test_streams.py`) waits out a
+  real interval with `asyncio.sleep()`.
 
 ---
 
@@ -114,7 +142,7 @@ follow someone, or vice versa.
 
 ## Redis mechanism
 
-**Rejected:** **`INCR`** **+** **`EXPIRE`****.** Not rejected because it's a bad Redis
+**Rejected: `INCR` + `EXPIRE`.** Not rejected because it's a bad Redis
 pattern in general — it's rejected because it cannot express trailing-
 window semantics at all. It has no concept of individual request
 timestamps, only one count tied to one reset clock, which is
@@ -164,19 +192,34 @@ itself.
 
 ## Failure behavior
 
-- **Fail open** only on a genuine infrastructure failure reaching the limiter (connection error, timeout, script error) — never when the limiter successfully determines the user is over budget. An "over limit" result is a completed, correct decision, not a failure; it must always return `429`.
-- Every fail-open event is logged. A fail-open path that never logs is a rate limiter that quietly stops enforcing without anyone noticing.
-- This is acceptable because rate-limit state is disposable enforcement state, not durable business state (see ADR-3) — losing it temporarily costs a window of under-enforcement, not corrupted data.
-- No changes to the existing failure semantics of `cache.py`, `event_bus.py`, or `ws_router.py`. Each keeps its own client and its own existing failure behavior, unmodified.
+- **Fail open** only on a genuine infrastructure failure reaching the
+  limiter (connection error, timeout, script error) — never when the
+  limiter successfully determines the user is over budget. An "over
+  limit" result is a completed, correct decision, not a failure; it
+  must always return `429`.
+- Every fail-open event is logged. A fail-open path that never logs is
+  a rate limiter that quietly stops enforcing without anyone noticing.
+- This is acceptable because rate-limit state is disposable enforcement
+  state, not durable business state (see ADR-3) — losing it temporarily
+  costs a window of under-enforcement, not corrupted data.
+- No changes to the existing failure semantics of `cache.py`,
+  `event_bus.py`, or `ws_router.py`. Each keeps its own client and its
+  own existing failure behavior, unmodified.
 
 ---
 
 ## HTTP contract
 
-- `429 Too Many Requests`, raised via the same `HTTPException` style every other route already uses.
+- `429 Too Many Requests`, raised via the same `HTTPException` style
+  every other route already uses.
 - `Retry-After` header, delta-seconds, computed as above.
-- `detail` stays a human-readable string (e.g. `"Rate limit exceeded for post_create. Try again in 12 seconds."`), consistent with existing `HTTPException` usage elsewhere in the app.
-- No `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers. That's standard practice for public APIs with external consumers who need to self-throttle; this app has one first-party frontend that does nothing with rate-limit visibility today. Deferred, not rejected.
+- `detail` stays a human-readable string
+  (e.g. `"Rate limit exceeded for post_create. Try again in 12 seconds."`),
+  consistent with existing `HTTPException` usage elsewhere in the app.
+- No `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers. That's
+  standard practice for public APIs with external consumers who need to
+  self-throttle; this app has one first-party frontend that does
+  nothing with rate-limit visibility today. Deferred, not rejected.
 
 ---
 
@@ -194,8 +237,6 @@ uses to declare route preconditions (`Depends(get_current_user)` sits
 in every protected route's signature today); inline would require
 reading into the function body to discover a route is rate-limited at
 all. Each protected route opts in explicitly:
-
-python
 
 ```python
 @app.post("/posts")
@@ -217,8 +258,6 @@ config, no generic "framework" surface.
 
 Following the existing flat-constant convention in `app/config.py`
 exactly (matching `HEAVY_FANOUT_THRESHOLD`'s shape):
-
-python
 
 ```python
 RATE_LIMIT_POST_CREATE_MAX              = int(os.getenv("RATE_LIMIT_POST_CREATE_MAX", "5"))
@@ -380,16 +419,23 @@ avoid that.
 
 ## Explicitly out of scope for M9
 
-- IP-based limiting for unauthenticated endpoints, including `GET /timeline/{user_id}` — a real, acknowledged resource-protection gap (see Reconnaissance), deliberately deferred because it needs a different key (IP, not `user_id`) and a different threat model than this milestone addresses.
+- IP-based limiting for unauthenticated endpoints, including
+  `GET /timeline/{user_id}` — a real, acknowledged resource-protection
+  gap (see Reconnaissance), deliberately deferred because it needs a
+  different key (IP, not `user_id`) and a different threat model than
+  this milestone addresses.
 - WebSocket connection limiting.
 - Global/API-wide rate limiting.
 - Token-bucket or any throughput-smoothing behavior.
-- Approximate/probabilistic fixed-window algorithms (e.g. Cloudflare-style weighted counters) — solve a memory-scale problem this project doesn't have, at the cost of exactness it does want.
+- Approximate/probabilistic fixed-window algorithms (e.g.
+  Cloudflare-style weighted counters) — solve a memory-scale problem
+  this project doesn't have, at the cost of exactness it does want.
 - Proactive `X-RateLimit-*` response headers.
 - Any change to `src/api.ts`'s error handling.
 - Metrics or structured observability beyond logging fail-open events.
 - Any event-bus, Outbox, or async-processing changes.
-- Any change to the existing failure semantics of `cache.py`, `event_bus.py`, or `ws_router.py`.
+- Any change to the existing failure semantics of `cache.py`,
+  `event_bus.py`, or `ws_router.py`.
 
 ## Known, accepted consequence (frontend)
 
@@ -420,15 +466,27 @@ file.
 
 Owns:
 
-- its own Redis client + `init_rate_limiter(url)` / `close_rate_limiter()` lifecycle functions, mirroring `cache.py`'s shape exactly.
-- an internal `_POLICIES: dict[str, tuple[int, int]]` mapping action name → `(max, window_seconds)`, built once from the four config constants.
-- the Lua script text (prune → count → conditional add → return allowed/oldest-timestamp), loaded once at init.
-- a low-level `_check(user_id, action) -> (allowed: bool, retry_after: float | None)` function that runs the script and computes `Retry-After` from the script's returned oldest-timestamp when `allowed` is `False`.
-- the public `rate_limit(action: str)` dependency factory: returns an async function usable in `Depends(...)`; on infrastructure error, catches, logs, and allows (fail-open); on a successful "over limit" result, raises `HTTPException(429, ..., headers={"Retry-After": ...})`.
+- its own Redis client + `init_rate_limiter(url)` / `close_rate_limiter()`
+  lifecycle functions, mirroring `cache.py`'s shape exactly.
+- an internal `_POLICIES: dict[str, tuple[int, int]]` mapping action
+  name → `(max, window_seconds)`, built once from the four config
+  constants.
+- the Lua script text (prune → count → conditional add → return
+  allowed/oldest-timestamp), loaded once at init.
+- a low-level `_check(user_id, action) -> (allowed: bool, retry_after: float | None)`
+  function that runs the script and computes `Retry-After` from the
+  script's returned oldest-timestamp when `allowed` is `False`.
+- the public `rate_limit(action: str)` dependency factory: returns an
+  async function usable in `Depends(...)`; on infrastructure error,
+  catches, logs, and allows (fail-open); on a successful "over limit"
+  result, raises `HTTPException(429, ..., headers={"Retry-After": ...})`.
 
 ### 3. `app/app.py` — modify
 
-- `lifespan()`: call `init_rate_limiter(REDIS_URL)` alongside the existing `db`/`cache`/`bus`/`router` init calls, and `close_rate_limiter()` in the teardown sequence, same ordering discipline already documented at the top of this file.
+- `lifespan()`: call `init_rate_limiter(REDIS_URL)` alongside the
+  existing `db`/`cache`/`bus`/`router` init calls, and
+  `close_rate_limiter()` in the teardown sequence, same ordering
+  discipline already documented at the top of this file.
 - `create_post`: add `Depends(rate_limit("post_create"))`.
 - `follow_user`: add `Depends(rate_limit("follow_action"))`.
 - `unfollow_user`: add `Depends(rate_limit("follow_action"))`.
@@ -442,20 +500,47 @@ existing `test_*.py` convention (no pytest, no mocking framework beyond
 targeted monkeypatching, real infrastructure, `assert` + printed
 sections). Planned coverage:
 
-- **Allow/deny at threshold** — seed nothing, issue `N` calls to `_check`, assert all allowed; issue one more, assert denied.
-- **Boundary correctness** — seed a synthetic ZSET entry with a timestamp fabricated to sit just outside vs. just inside `(now − W, now]`, and assert it is/isn't counted. No `sleep()` needed — this is the concrete payoff of choosing a ZSET (Recon item 5).
-- **`Retry-After`** **correctness** — with a known set of seeded timestamps, assert the returned value matches `(oldest + W) − now` within a small tolerance.
-- **Concurrency / atomicity** — fire `N + 5` concurrent `_check` calls for the same `(user_id, action)` via `asyncio.gather`, assert exactly `N` are allowed and `5` are denied. This is the test that actually exercises the Lua script's atomicity guarantee (ADR-6); without it, the design's central correctness claim is unverified.
-- **Bucket independence** — exhausting `post_create` for a user does not affect that user's `follow_action` count, and vice versa.
-- **Shared** **`follow_action`** **bucket** — alternating follow/unfollow calls for the same user consume the same budget (confirms ADR-4 behavior at the mechanism level, not just in the design doc).
-- **Fail-open** — monkeypatch the rate limiter's Redis client method to raise (mirroring `test_notification_hints.py`'s `manager.send` monkeypatch technique), call `rate_limit(...)`'s dependency function directly, assert it does not raise `HTTPException` and that a log line was emitted.
-- One short-window, real-time integration check (e.g. `N=2`, `W=2s`) that actually waits with `asyncio.sleep()` past the window and confirms a previously-denied user is allowed again — a small, cheap version of `test_streams.py`'s real-time-wait precedent, kept purely as an end-to-end sanity check on top of the seeded-timestamp unit tests above, not a replacement for them.
+- **Allow/deny at threshold** — seed nothing, issue `N` calls to
+  `_check`, assert all allowed; issue one more, assert denied.
+- **Boundary correctness** — seed a synthetic ZSET entry with a
+  timestamp fabricated to sit just outside vs. just inside
+  `(now − W, now]`, and assert it is/isn't counted. No `sleep()` needed
+  — this is the concrete payoff of choosing a ZSET (Recon item 5).
+- **`Retry-After` correctness** — with a known set of seeded
+  timestamps, assert the returned value matches `(oldest + W) − now`
+  within a small tolerance.
+- **Concurrency / atomicity** — fire `N + 5` concurrent `_check` calls
+  for the same `(user_id, action)` via `asyncio.gather`, assert exactly
+  `N` are allowed and `5` are denied. This is the test that actually
+  exercises the Lua script's atomicity guarantee (ADR-6); without it,
+  the design's central correctness claim is unverified.
+- **Bucket independence** — exhausting `post_create` for a user does
+  not affect that user's `follow_action` count, and vice versa.
+- **Shared `follow_action` bucket** — alternating follow/unfollow calls
+  for the same user consume the same budget (confirms ADR-4 behavior
+  at the mechanism level, not just in the design doc).
+- **Fail-open** — monkeypatch the rate limiter's Redis client method to
+  raise (mirroring `test_notification_hints.py`'s `manager.send`
+  monkeypatch technique), call `rate_limit(...)`'s dependency function
+  directly, assert it does not raise `HTTPException` and that a log
+  line was emitted.
+- One short-window, real-time integration check (e.g. `N=2`, `W=2s`)
+  that actually waits with `asyncio.sleep()` past the window and
+  confirms a previously-denied user is allowed again — a small, cheap
+  version of `test_streams.py`'s real-time-wait precedent, kept purely
+  as an end-to-end sanity check on top of the seeded-timestamp unit
+  tests above, not a replacement for them.
 
 ### 5. Manual E2E verification (post-implementation, not automated)
 
-- Hit `POST /posts` 6 times rapidly as a seed user (default limit 5); confirm the 6th returns `429` with a `Retry-After` header; wait out the window; confirm success resumes.
-- Alternate follow/unfollow against the same target rapidly; confirm the shared `follow_action` bucket is exhausted by the combination, not by either action alone.
-- Confirm a `post_create` rejection does not affect the ability to follow/unfollow in the same window, and vice versa.
+- Hit `POST /posts` 6 times rapidly as a seed user (default limit 5);
+  confirm the 6th returns `429` with a `Retry-After` header; wait out
+  the window; confirm success resumes.
+- Alternate follow/unfollow against the same target rapidly; confirm
+  the shared `follow_action` bucket is exhausted by the combination,
+  not by either action alone.
+- Confirm a `post_create` rejection does not affect the ability to
+  follow/unfollow in the same window, and vice versa.
 
 ### 6. Documentation
 
@@ -470,5 +555,208 @@ are complete — status line changed from "DESIGN COMPLETE" to
 
 None. Every semantic, mechanism, failure-mode, contract, placement, and
 configuration decision needed to implement M9 correctly has been made
-above. Implementation should not need to make any further architectural
-choice beyond ordinary coding judgment.
+above. Implementation did not require any further architectural choice
+beyond ordinary coding judgment — see "Implementation notes" below for
+the two judgment calls that did come up, neither of which changes any
+approved decision.
+
+---
+
+## What was built
+
+### New files
+
+```text
+app/rate_limit.py     — sliding-window-log limiter: Redis client,
+                         policy table, Lua script, check_rate_limit(),
+                         rate_limit() dependency factory
+test_rate_limit.py     — direct verification against real Redis
+```
+
+### Modified files
+
+```text
+app/config.py   — four new flat constants (RATE_LIMIT_POST_CREATE_MAX/
+                  WINDOW_SECONDS, RATE_LIMIT_FOLLOW_ACTION_MAX/
+                  WINDOW_SECONDS)
+app/app.py      — lifespan now calls init_rate_limiter()/
+                  close_rate_limiter() alongside db/cache/bus/router;
+                  POST /posts, POST /me/follow/{id}, and
+                  DELETE /me/follow/{id} each gained
+                  Depends(rate_limit(...))
+```
+
+### Unchanged
+
+`worker.py`, `app/db.py`, `app/cache.py`, `app/event_bus.py`,
+`app/ws_router.py`, `app/ws_manager.py`, `app/consumers.py`,
+`app/notifications.py`, all frontend files — confirms the design's
+claim that the limiter is a self-contained precondition gate with no
+dependency on the worker process, the event bus, or any existing Redis
+consumer's behavior.
+
+## Implementation notes (judgment calls made during implementation, not design changes)
+
+**"Now" is Redis's own clock (`TIME`), not the caller's `time.time()`.**
+The design says "score = request timestamp" without specifying which
+clock produces it. Since `app.py` is meant to run behind multiple
+Uvicorn workers (ADR-1's own justification for using Redis at all),
+computing "now" via each worker's local system clock would make the
+sliding window sensitive to clock drift between workers. Computing it
+once, inside the Lua script, from Redis's own `TIME` command gives every
+worker the same authoritative time source. This doesn't change any
+approved semantic — it's a stricter, more correct realization of
+"timestamp" than the design needed to specify.
+
+**The fail-open catch is scoped to `redis.exceptions.RedisError`
+specifically, not a bare `except Exception`.** A bare catch would also
+silently swallow a genuine programming error — e.g. a typo passing
+`rate_limit("post_creat")` to a route — as if it were an infrastructure
+failure, masking a bug as "working as designed, just less strictly."
+`check_rate_limit()` raises `ValueError` for an unknown action, and that
+exception is deliberately allowed to propagate rather than being caught
+by the fail-open path. This keeps "fail open only on genuine
+infrastructure failure" (the approved decision) true in practice, not
+just in the docstring.
+
+Per your instruction, neither of these was treated as license to reopen
+any settled decision — both are implementation-level realizations of
+decisions already made, not new ones.
+
+## Automated test results
+
+Run against a real, live local Redis instance (see status note above):
+
+```text
+[1] Threshold — exactly max_count allowed, then denied
+    ✅  20 allowed, request 21 denied with retry_after=60s
+ 
+[2] Boundary correctness — entries outside the window are pruned, inside survive
+    ✅  in-window entry survived pruning, out-of-window entry was removed
+    ✅  entry exactly at the window boundary was correctly excluded
+ 
+[3] Retry-After — derived from the oldest surviving entry, not Redis TTL
+    ✅  retry_after=50s ≈ expected 50.0s (oldest entry was 10.0s old)
+ 
+[4] Concurrency — N+5 simultaneous requests resolve to exactly N allowed
+    ✅  25 concurrent requests -> exactly 20 allowed (atomic, no over-admission)
+ 
+[5] Bucket independence — post_create and follow_action don't interfere
+    ✅  exhausting post_create left follow_action fully available for the same user
+ 
+[6] Shared follow_action bucket drains under alternating calls
+    ✅  20 alternating follow/unfollow-equivalent calls exhausted the single shared bucket
+ 
+[7] Fail-open — a Redis/script failure is caught, allowed through, and logged
+    ✅  rate_limit() dependency swallowed the infrastructure failure without raising
+    ✅  fail-open event was logged: [RateLimit] FAIL-OPEN for user=failopen-8ec3adc3 action=post_create — infrastructure error: ConnectionError('simulated Redis outage')
+    ✅  an unknown action raises ValueError immediately rather than being fail-opened
+ 
+[8] Short real-time window expiry (small window, real sleep — like test_streams.py)
+    ✅  capacity genuinely returned after real wall-clock time passed
+ 
+Exit code: 0. All 8 sections passed.
+```
+
+Section [4] is the one that actually matters most: it's the direct,
+empirical test of ADR-6's atomicity claim, not just a plausibility
+argument. 25 truly concurrent coroutines hitting the same
+`(user_id, action)` key resolved to exactly 20 allowed — no
+over-admission — which is only possible if the Lua script's
+prune→count→conditional-add is genuinely atomic against Redis.
+
+Fail-open's log line was confirmed emitted (via the standard `logging`
+module, visible on stderr):
+
+```text
+[RateLimit] FAIL-OPEN for user=failopen-3378c5c9 action=post_create — infrastructure error: ConnectionError('simulated Redis outage')
+```
+
+## Manual E2E verification
+
+Performed via direct HTTP requests (`httpx`, script:
+`e2e_verify_m9.py`) against a real running instance of the app
+(`uvicorn app.app:app`, real local Postgres, real local Redis) — this
+milestone has no browser-visible UI effect to click through (the
+frontend doesn't special-case `429` at all — see "Known, accepted
+consequence" above), so hitting the actual endpoints and inspecting
+real status codes/headers **is** the meaningful end-to-end check here,
+not a stand-in for one. Windows were temporarily shortened via the
+existing env vars (`RATE_LIMIT_POST_CREATE_MAX=3` /
+`WINDOW_SECONDS=4`, `RATE_LIMIT_FOLLOW_ACTION_MAX=3` /
+`WINDOW_SECONDS=4`) purely so the "wait out the window" step was
+practical to run live — same code path, same dependency, smaller
+numbers. Full server log and script output below are from the actual
+run, not reconstructed.
+
+**Test 1 — `POST /posts`, 4 rapid requests as `alice` (limit 3).**
+Requests 1–3 returned `200`; request 4 returned `429` with a
+`Retry-After` header. Waiting out that real `Retry-After` value (5s)
+and retrying succeeded again:
+
+```text
+✅  first 3 requests succeed, 4th is 429       — [200, 200, 200, 429]
+✅  429 response carries a Retry-After header
+      Retry-After: 4s — waiting 5s for the real window to elapse...
+✅  posting succeeds again after the real window elapses
+```
+
+Server-side log for the same sequence confirms the precondition-gate
+design (ADR-2) end-to-end, not just by inspection of the code: exactly
+three `💾 [Cache] warmed post:...` lines appear before the `429` —
+the rejected 4th request never reached `create_post`'s body at all, no
+Postgres write, no cache warm, no event bus publish:
+
+```text
+💾  [Cache] warmed post:b4e1826a
+INFO: "POST /posts HTTP/1.1" 200 OK
+💾  [Cache] warmed post:acd901c9
+INFO: "POST /posts HTTP/1.1" 200 OK
+💾  [Cache] warmed post:87efbc4b
+INFO: "POST /posts HTTP/1.1" 200 OK
+INFO: "POST /posts HTTP/1.1" 429 Too Many Requests
+```
+
+**Test 2 — shared `follow_action` bucket, live (`bob` → `dave`,
+limit 3).** Alternating `POST /me/follow/dave` / `DELETE /me/follow/dave`
+three times all returned `200`; the 4th call (a follow) returned `429`
+— confirming ADR-4 at the HTTP layer, not just in the unit-level test:
+
+```text
+✅  3 alternating follow/unfollow calls succeed, 4th (shared bucket) is 429
+      [('follow', 200), ('unfollow', 200), ('follow', 200), ('unfollow', 429)]
+```
+
+**Test 3 — bucket independence, live.** With `alice`'s `post_create`
+bucket exhausted from Test 1, `POST /me/follow/dave` as `alice`
+returned `200` immediately. With `bob`'s `follow_action` bucket
+exhausted from Test 2, `POST /posts` as `bob` returned `200`
+immediately:
+
+```text
+✅  alice can still follow (follow_action) despite post_create being exhausted
+✅  bob can still post (post_create) despite follow_action being exhausted
+```
+
+Full script result: `✅ All M9 manual E2E checks passed against the
+live running app` (exit code 0). No warnings, tracebacks, or unexpected
+log lines appeared anywhere in the server log across the whole run.
+
+## Deviations from the approved design
+
+None. Every semantic, mechanism, failure-mode, contract, placement, and
+configuration decision was implemented as specified. The two items
+under "Implementation notes" above are realizations of already-approved
+decisions (which clock produces "now"; which exception type fail-open
+catches), not changes to what was approved.
+
+## Issues discovered during implementation
+
+- `app/auth.py` imports `jwt` (PyJWT), but `pyproject.toml`/`uv.lock`
+  list no such dependency — a pre-existing gap unrelated to M9, noticed
+  only because building a clean environment to test in required
+  installing it explicitly. Worth a one-line fix to `pyproject.toml`
+  at some point; not part of this milestone's scope and not touched
+  here.
+- No other issues. The design held up under real concurrent load and
+  real wall-clock timing with no adjustments needed.
